@@ -23,12 +23,8 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
 app.use(
   cors({
     origin: (origin, cb) => {
-      // allow non-browser tools (no origin)
       if (!origin) return cb(null, true);
-
-      // if no allowlist set, allow all
       if (ALLOWED_ORIGINS.length === 0) return cb(null, true);
-
       if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
       return cb(new Error("CORS blocked for origin: " + origin));
     },
@@ -40,27 +36,27 @@ app.use(express.json({ limit: "25mb" }));
 
 // ----- Config -----
 const PORT = process.env.PORT || 8787;
-
-// Optional legacy static token support
 const AUTH_TOKEN = (process.env.AUTH_TOKEN || "").trim();
-
-// Admin credentials for login
 const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || "").trim().toLowerCase();
 const ADMIN_PASSWORD = (process.env.ADMIN_PASSWORD || "").trim();
-
-// JWT secret for issuing/verifying tokens
 const JWT_SECRET = (process.env.JWT_SECRET || "").trim();
 
 /**
  * Storage directory
- * - On Render: attach a Disk and use /var/data/habesha (recommended)
- * - Without a disk: /tmp works but resets on redeploy
+ * - Priority 1: BASE_DIR env var (if you set it)
+ * - Priority 2 (LOCAL DEFAULT): OneDrive\Documents\Habesha   ✅ (your real path)
+ * - Priority 3 (Render): /var/data/habesha
  */
+const LOCAL_DEFAULT_BASE_DIR = path.join(
+  os.homedir(),
+  "OneDrive",
+  "Documents",
+  "Habesha"
+);
+
 const BASE_DIR =
   process.env.BASE_DIR ||
-  (process.env.RENDER
-    ? "/var/data/habesha"
-    : path.join(os.homedir(), "Documents", "Habesha"));
+  (process.env.RENDER ? "/var/data/habesha" : LOCAL_DEFAULT_BASE_DIR);
 
 const CLIENTS_DIR = path.join(BASE_DIR, "clients");
 
@@ -70,10 +66,9 @@ function ensureDir(p) {
 }
 
 function safeName(input) {
-  // allow letters, numbers, dash, underscore, dot
   return String(input || "")
     .trim()
-    .replace(/[^a-zA-Z0-9._-]/g, "_")
+    .replace(/[^a-zA-Z0-9._ -]/g, "_")
     .slice(0, 120);
 }
 
@@ -99,17 +94,26 @@ function verifyJwtToken(token) {
   }
 }
 
-// Protect only /api routes
+/**
+ * ✅ Ensure "Church Related" exists inside "04 Personal" for:
+ * 1) A specific client folder: <BASE_DIR>/clients/<client>/04 Personal/Church Related
+ * 2) The global personal folder: <BASE_DIR>/04 Personal/Church Related
+ */
+function ensureChurchRelatedFolder(targetBasePath) {
+  const personalDir = path.join(targetBasePath, "04 Personal");
+  const churchDir = path.join(personalDir, "Church Related");
+  ensureDir(personalDir);
+  ensureDir(churchDir);
+}
+
+// ----- Auth -----
 function requireAuth(req, res, next) {
-  // If no auth configured, do not lock yourself out
   if (!AUTH_TOKEN && !JWT_SECRET) return next();
 
   const token = getBearer(req);
 
-  // 1) Allow old fixed AUTH_TOKEN
   if (AUTH_TOKEN && token === AUTH_TOKEN) return next();
 
-  // 2) Allow JWT
   const payload = verifyJwtToken(token);
   if (payload) {
     req.user = payload;
@@ -119,70 +123,59 @@ function requireAuth(req, res, next) {
   return res.status(401).json({ ok: false, error: "Unauthorized" });
 }
 
+// Ensure base folders exist
+ensureDir(BASE_DIR);
 ensureDir(CLIENTS_DIR);
 
 // ----- Health -----
-app.get("/health", (req, res) => res.status(200).send("ok"));
+app.get("/health", (req, res) => res.send("ok"));
 
 app.get("/api/health", (req, res) =>
-  res.status(200).json({
+  res.json({
     ok: true,
-    service: "habeshaweb",
     baseDir: BASE_DIR,
     clientsDir: CLIENTS_DIR,
+    runningOn: process.env.RENDER ? "render" : "local",
   })
 );
 
-// ----- Home -----
-app.get("/", (req, res) => {
-  res
-    .status(200)
-    .send("HabeshaWeb backend is running. Try /health or /api/health");
+// ----- Login -----
+app.post("/login", (req, res) => {
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  const password = String(req.body?.password || "").trim();
+
+  if (email !== ADMIN_EMAIL || password !== ADMIN_PASSWORD) {
+    return res.status(401).json({ ok: false, error: "Invalid login" });
+  }
+
+  if (!JWT_SECRET) {
+    return res.status(500).json({ ok: false, error: "JWT_SECRET not set" });
+  }
+
+  const user = { id: "admin", email, role: "admin" };
+  const token = jwt.sign(user, JWT_SECRET, { expiresIn: "7d" });
+
+  res.json({ ok: true, token, user });
 });
 
-// ----- LOGIN (PUBLIC) -----
-// POST /login  body: { email, password }
-app.post("/login", (req, res) => {
+app.use("/api", requireAuth);
+
+// ----- GLOBAL PERSONAL (your OneDrive folder) -----
+// Create: <BASE_DIR>/04 Personal/Church Related
+app.post("/api/personal/church-related", (req, res) => {
   try {
-    const email = String(req.body?.email || "").trim().toLowerCase();
-    const password = String(req.body?.password || "").trim();
-
-    if (!ADMIN_EMAIL || !ADMIN_PASSWORD) {
-      return res.status(500).json({
-        ok: false,
-        error: "ADMIN_EMAIL / ADMIN_PASSWORD not set on server",
-      });
-    }
-
-    if (email !== ADMIN_EMAIL || password !== ADMIN_PASSWORD) {
-      return res.status(401).json({ ok: false, error: "Invalid login" });
-    }
-
-    if (!JWT_SECRET) {
-      return res.status(500).json({
-        ok: false,
-        error: "JWT_SECRET not set on server",
-      });
-    }
-
-    const user = { id: "admin", email: ADMIN_EMAIL, role: "admin" };
-    const token = jwt.sign(user, JWT_SECRET, { expiresIn: "7d" });
-
-    return res.json({ ok: true, token, user });
+    ensureChurchRelatedFolder(BASE_DIR);
+    return res.json({
+      ok: true,
+      created: path.join("04 Personal", "Church Related"),
+      location: path.join(BASE_DIR, "04 Personal", "Church Related"),
+    });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// OPTIONAL (but recommended): who am I? (requires auth header)
-app.get("/api/me", requireAuth, (req, res) => {
-  // if you used JWT, req.user will exist; if AUTH_TOKEN, req.user may be undefined
-  res.json({ ok: true, user: req.user || { id: "legacy", role: "admin" } });
-});
-
-// ----- API -----
-app.use("/api", requireAuth);
-
+// ----- Clients -----
 // List clients (folders)
 app.get("/api/clients", (req, res) => {
   try {
@@ -198,18 +191,18 @@ app.get("/api/clients", (req, res) => {
   }
 });
 
-// Create client folder
+// Create client folder + ensure per-client personal/church folder exists
 app.post("/api/clients", (req, res) => {
   try {
     const name = safeName(req.body?.name);
-    if (!name) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "Client name required" });
-    }
+    if (!name)
+      return res.status(400).json({ ok: false, error: "name required" });
 
     const clientPath = resolveInside(CLIENTS_DIR, name);
     ensureDir(clientPath);
+
+    // ✅ Per-client: clients/<name>/04 Personal/Church Related
+    ensureChurchRelatedFolder(clientPath);
 
     res.json({ ok: true, client: name });
   } catch (e) {
@@ -217,12 +210,15 @@ app.post("/api/clients", (req, res) => {
   }
 });
 
-// List files for a client
+// List files for a client + auto-fix folder for old clients
 app.get("/api/clients/:client/files", (req, res) => {
   try {
     const client = safeName(req.params.client);
     const clientPath = resolveInside(CLIENTS_DIR, client);
     ensureDir(clientPath);
+
+    // ✅ Ensure folder exists for older clients
+    ensureChurchRelatedFolder(clientPath);
 
     const items = fs.readdirSync(clientPath, { withFileTypes: true }).map((d) => ({
       name: d.name,
@@ -235,87 +231,9 @@ app.get("/api/clients/:client/files", (req, res) => {
   }
 });
 
-// Download a file: /api/clients/{client}/download?file=some.pdf
-app.get("/api/clients/:client/download", (req, res) => {
-  try {
-    const client = safeName(req.params.client);
-    const file = String(req.query.file || "");
-    if (!file) {
-      return res.status(400).json({ ok: false, error: "file query required" });
-    }
-
-    const clientPath = resolveInside(CLIENTS_DIR, client);
-    const full = resolveInside(clientPath, file);
-
-    if (!fs.existsSync(full)) {
-      return res.status(404).json({ ok: false, error: "Not found" });
-    }
-    if (fs.statSync(full).isDirectory()) {
-      return res.status(400).json({ ok: false, error: "Not a file" });
-    }
-
-    res.download(full);
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// Upload base64
-// Body: { fileName: "abc.pdf", base64: "data:application/pdf;base64,...." } OR raw base64
-app.post("/api/clients/:client/uploadBase64", (req, res) => {
-  try {
-    const client = safeName(req.params.client);
-    const fileName = safeName(req.body?.fileName);
-    const base64Input = String(req.body?.base64 || "");
-
-    if (!fileName) return res.status(400).json({ ok: false, error: "fileName required" });
-    if (!base64Input) return res.status(400).json({ ok: false, error: "base64 required" });
-
-    const clientPath = resolveInside(CLIENTS_DIR, client);
-    ensureDir(clientPath);
-
-    const full = resolveInside(clientPath, fileName);
-
-    const cleaned = base64Input.includes("base64,")
-      ? base64Input.split("base64,")[1]
-      : base64Input;
-
-    const buf = Buffer.from(cleaned, "base64");
-    fs.writeFileSync(full, buf);
-
-    res.json({ ok: true, savedAs: fileName, bytes: buf.length });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// Delete file
-app.delete("/api/clients/:client/file", (req, res) => {
-  try {
-    const client = safeName(req.params.client);
-    const file = String(req.query.file || "");
-    if (!file) return res.status(400).json({ ok: false, error: "file query required" });
-
-    const clientPath = resolveInside(CLIENTS_DIR, client);
-    const full = resolveInside(clientPath, file);
-
-    if (!fs.existsSync(full)) return res.status(404).json({ ok: false, error: "Not found" });
-    if (fs.statSync(full).isDirectory()) {
-      return res.status(400).json({ ok: false, error: "Not a file" });
-    }
-
-    fs.unlinkSync(full);
-    res.json({ ok: true, deleted: file });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
 // ----- Start -----
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`HabeshaWeb backend running on :${PORT}`);
-  console.log(`AUTH_TOKEN set: ${AUTH_TOKEN ? "YES" : "NO"}`);
-  console.log(`JWT_SECRET set: ${JWT_SECRET ? "YES" : "NO"}`);
-  console.log(`ADMIN_EMAIL set: ${ADMIN_EMAIL ? "YES" : "NO"}`);
   console.log(`BASE_DIR: ${BASE_DIR}`);
+  console.log(`CLIENTS_DIR: ${CLIENTS_DIR}`);
 });
