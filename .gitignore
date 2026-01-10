@@ -7,10 +7,14 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
+# Dependencies & build
 node_modules
 dist
 dist-ssr
 *.local
+
+# Environment files
+.env
 
 # Editor directories and files
 .vscode/*
@@ -22,7 +26,3 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
-Remove-Item -Recurse -Force .\.env
-Remove-Item -Recurse -Force .\.env
-
-
