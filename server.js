@@ -49,9 +49,7 @@ const JWT_SECRET = (process.env.JWT_SECRET || "").trim();
 
 const BASE_DIR =
   process.env.BASE_DIR ||
-  (process.env.RENDER
-    ? "/tmp/habesha"
-    : path.join(os.homedir(), "Documents", "Habesha"));
+  (process.env.RENDER ? "/tmp/habesha" : path.join(os.homedir(), "Documents", "Habesha"));
 
 const CLIENTS_DIR = path.join(BASE_DIR, "clients");
 
@@ -61,6 +59,7 @@ function ensureDir(p) {
 }
 
 function safeName(input) {
+  // allow letters, numbers, dot, underscore, dash, space
   return String(input || "")
     .trim()
     .replace(/[^a-zA-Z0-9._ -]/g, "_")
@@ -120,22 +119,22 @@ function normalizeRelPath(p) {
   const raw = String(p || "").trim();
   if (!raw) return "";
 
-  // convert backslashes to forward slashes
+  // convert backslashes to forward slashes and remove leading slashes
   const cleaned = raw.replace(/\\/g, "/").replace(/^\/+/, "");
 
-  // block traversal + weird encodings
+  // block traversal + null byte
   const decoded = decodeURIComponent(cleaned);
   if (decoded.includes("..")) throw new Error("Invalid path");
   if (decoded.includes("\0")) throw new Error("Invalid path");
 
-  // remove any duplicate slashes
+  // remove duplicate slashes
   return decoded.replace(/\/{2,}/g, "/");
 }
 
 function getCurrentTaxYearLabel(now = new Date()) {
   // UK tax year: 6 April -> 5 April
   const y = now.getFullYear();
-  const april6 = new Date(y, 3, 6); // month 3 = April
+  const april6 = new Date(y, 3, 6);
   const startYear = now >= april6 ? y : y - 1;
   const endYear = startYear + 1;
   return `${startYear}-${String(endYear).slice(2)}`; // e.g. 2025-26
@@ -170,16 +169,13 @@ function createStandardClientRoot(clientPath) {
 
   // Proof of ID subfolders
   const idBase = path.join(clientPath, "01 Proof of ID");
-  [
-    "01 Passport - BRP - eVisa",
-    "02 Proof of Address",
-    "03 Signed Engagement Letter",
-  ].forEach((s) => ensureDir(path.join(idBase, s)));
+  ["01 Passport - BRP - eVisa", "02 Proof of Address", "03 Signed Engagement Letter"].forEach((s) =>
+    ensureDir(path.join(idBase, s))
+  );
 }
 
 function normalizeBusinessType(businessType) {
   const t = String(businessType || "").trim().toLowerCase();
-  // accept both your wording + variants
   if (t === "landlord") return "landlords";
   if (t === "individual") return "self_assessment";
   if (t === "self assessment") return "self_assessment";
@@ -189,9 +185,7 @@ function normalizeBusinessType(businessType) {
 
 function normalizeServices(services) {
   if (!Array.isArray(services)) return [];
-  return services
-    .map((s) => String(s || "").trim().toLowerCase())
-    .filter(Boolean);
+  return services.map((s) => String(s || "").trim().toLowerCase()).filter(Boolean);
 }
 
 function createComplianceStructure(clientPath, businessType, services) {
@@ -211,7 +205,7 @@ function createComplianceStructure(clientPath, businessType, services) {
 
     const current = getCurrentTaxYearLabel();
     const startYear = parseInt(current.split("-")[0], 10);
-    const prev = `${startYear - 1}-${String(startYear).slice(2)}`; // e.g. 2024-25
+    const prev = `${startYear - 1}-${String(startYear).slice(2)}`;
 
     createTaxYearTree(sa, prev);
     createTaxYearTree(sa, current);
@@ -229,12 +223,9 @@ function createComplianceStructure(clientPath, businessType, services) {
     createTaxYearTree(ll, prev);
     createTaxYearTree(ll, current);
 
-    [
-      "08 Properties",
-      "09 Tenancy Agreements",
-      "10 Mortgage Interest",
-      "11 Letting Agent Statements",
-    ].forEach((s) => ensureDir(path.join(ll, s)));
+    ["08 Properties", "09 Tenancy Agreements", "10 Mortgage Interest", "11 Letting Agent Statements"].forEach(
+      (s) => ensureDir(path.join(ll, s))
+    );
   }
 
   // --- Limited Company ---
@@ -263,8 +254,8 @@ function createComplianceStructure(clientPath, businessType, services) {
   if (svc.includes("bookkeeping")) {
     const bk = path.join(complianceBase, "04 Bookkeeping");
     ensureDir(bk);
-    ["01 Sales", "02 Purchases", "03 Banking", "04 Reports", "05 Queries"].forEach(
-      (s) => ensureDir(path.join(bk, s))
+    ["01 Sales", "02 Purchases", "03 Banking", "04 Reports", "05 Queries"].forEach((s) =>
+      ensureDir(path.join(bk, s))
     );
   }
 
@@ -272,12 +263,9 @@ function createComplianceStructure(clientPath, businessType, services) {
   if (svc.includes("vat_mtd")) {
     const vat = path.join(complianceBase, "05 VAT (MTD)");
     ensureDir(vat);
-    [
-      "01 VAT Returns",
-      "02 VAT Working Papers",
-      "03 VAT Receipts",
-      "04 Final & Submitted",
-    ].forEach((s) => ensureDir(path.join(vat, s)));
+    ["01 VAT Returns", "02 VAT Working Papers", "03 VAT Receipts", "04 Final & Submitted"].forEach((s) =>
+      ensureDir(path.join(vat, s))
+    );
   }
 
   // --- Payroll ---
@@ -295,12 +283,12 @@ function createComplianceStructure(clientPath, businessType, services) {
     ].forEach((s) => ensureDir(path.join(pr, s)));
   }
 
-  // --- Home Office / Other applications ---
+  // --- Home Office ---
   if (svc.includes("home_office")) {
     const ho = path.join(complianceBase, "07 Home Office Applications");
     ensureDir(ho);
-    ["01 Applications", "02 Supporting Docs", "03 Correspondence", "04 Final & Submitted"].forEach(
-      (s) => ensureDir(path.join(ho, s))
+    ["01 Applications", "02 Supporting Docs", "03 Correspondence", "04 Final & Submitted"].forEach((s) =>
+      ensureDir(path.join(ho, s))
     );
   }
 }
@@ -344,9 +332,7 @@ app.get("/", (req, res) => {
 
 // Helpful (so browser doesn't say Cannot GET /login)
 app.get("/login", (req, res) => {
-  res
-    .status(200)
-    .send("Use POST /login with JSON body { email, password }. This is an API endpoint.");
+  res.status(200).send("Use POST /login with JSON body { email, password }. This is an API endpoint.");
 });
 
 // ----- LOGIN (PUBLIC) -----
@@ -430,6 +416,62 @@ app.post("/api/clients", (req, res) => {
   }
 });
 
+// ✅ NEW: create folder (mkdir) (supports ?path=...)
+// body: { name }
+app.post("/api/clients/:client/mkdir", (req, res) => {
+  try {
+    const client = safeName(req.params.client);
+    const rel = normalizeRelPath(req.query.path || "");
+    const name = safeName(req.body?.name);
+
+    if (!name) return res.status(400).json({ ok: false, error: "name required" });
+
+    const clientPath = resolveInside(CLIENTS_DIR, client);
+    ensureDir(clientPath);
+
+    const targetDir = rel ? resolveInside(clientPath, rel) : clientPath;
+    ensureDir(targetDir);
+
+    const folderPath = resolveInside(targetDir, name);
+    ensureDir(folderPath);
+
+    res.json({ ok: true, created: true, name, path: rel });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ✅ NEW: write text file (supports ?path=...)
+// body: { fileName, text }
+app.post("/api/clients/:client/writeText", (req, res) => {
+  try {
+    const client = safeName(req.params.client);
+    const rel = normalizeRelPath(req.query.path || "");
+    const fileName = safeName(req.body?.fileName);
+    const text = String(req.body?.text || "");
+
+    if (!fileName) return res.status(400).json({ ok: false, error: "fileName required" });
+
+    const clientPath = resolveInside(CLIENTS_DIR, client);
+    ensureDir(clientPath);
+
+    const targetDir = rel ? resolveInside(clientPath, rel) : clientPath;
+    ensureDir(targetDir);
+
+    const full = resolveInside(targetDir, fileName);
+    fs.writeFileSync(full, text, "utf8");
+
+    res.json({
+      ok: true,
+      savedAs: fileName,
+      bytes: Buffer.byteLength(text, "utf8"),
+      path: rel,
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ✅ List files/folders for a client (supports ?path=sub/folder)
 app.get("/api/clients/:client/files", (req, res) => {
   try {
@@ -447,7 +489,6 @@ app.get("/api/clients/:client/files", (req, res) => {
       type: d.isDirectory() ? "dir" : "file",
     }));
 
-    // nicer ordering: dirs first then files, both alphabetical
     raw.sort((a, b) => {
       if (a.type !== b.type) return a.type === "dir" ? -1 : 1;
       return a.name.localeCompare(b.name);
@@ -478,8 +519,7 @@ app.get("/api/clients/:client/download", (req, res) => {
     const full = resolveInside(targetDir, file);
 
     if (!fs.existsSync(full)) return res.status(404).json({ ok: false, error: "Not found" });
-    if (fs.statSync(full).isDirectory())
-      return res.status(400).json({ ok: false, error: "Not a file" });
+    if (fs.statSync(full).isDirectory()) return res.status(400).json({ ok: false, error: "Not a file" });
 
     res.download(full);
   } catch (e) {
@@ -504,14 +544,14 @@ app.post("/api/clients/:client/uploadBase64", (req, res) => {
     fileName = addExtIfMissing(fileName, contentType);
 
     const clientPath = resolveInside(CLIENTS_DIR, client);
+    ensureDir(clientPath);
+
     const targetDir = rel ? resolveInside(clientPath, rel) : clientPath;
     ensureDir(targetDir);
 
     const full = resolveInside(targetDir, fileName);
 
-    const cleaned = base64Input.includes("base64,")
-      ? base64Input.split("base64,")[1]
-      : base64Input;
+    const cleaned = base64Input.includes("base64,") ? base64Input.split("base64,")[1] : base64Input;
 
     const buf = Buffer.from(cleaned, "base64");
     fs.writeFileSync(full, buf);
@@ -535,8 +575,7 @@ app.delete("/api/clients/:client/file", (req, res) => {
     const full = resolveInside(targetDir, file);
 
     if (!fs.existsSync(full)) return res.status(404).json({ ok: false, error: "Not found" });
-    if (fs.statSync(full).isDirectory())
-      return res.status(400).json({ ok: false, error: "Not a file" });
+    if (fs.statSync(full).isDirectory()) return res.status(400).json({ ok: false, error: "Not a file" });
 
     fs.unlinkSync(full);
     res.json({ ok: true, deleted: file, path: rel });
