@@ -618,37 +618,25 @@ app.post("/api/clients/:client/trash", (req, res) => {
 
 /**
  * ♻️ Restore from Trash (FILES + FOLDERS)
+ * POST /api/clients/:client/restore?path=...&name=...
  *
- * POST /api/clients/:client/restore
- * query: ?path=<originalRelativePathInsideClient>&name=<trashedNameInTrash>
- *
- * Example:
- *   restore a trashed file that was originally in "02 Compliance/01 Self Assessment"
- *   and is currently in trash under the same subpath:
- *
- *   POST /api/clients/ClientName/restore?path=02%20Compliance/01%20Self%20Assessment&name=file.pdf
- *
- * Notes:
- * - Trash stores items inside: 05 Downloads/_Trash/<path>/<name>
- * - Restore moves it back to: <clientRoot>/<path>/<name>
- * - If destination already exists, we auto-rename restored item with timestamp suffix.
- * - Uses rename first, then copy+delete fallback (same as trash).
+ * path = original folder relative path (mirrored under _Trash)
+ * name = trashed item name inside the trash folder (may include __timestamp)
  */
 app.post("/api/clients/:client/restore", (req, res) => {
   try {
     const client = safeName(req.params.client);
-    const rel = normalizeRelPath(req.query.path || ""); // original folder relative path
-    const name = safeName(req.query.name || req.body?.name); // allow either query or body
+    const rel = normalizeRelPath(req.query.path || "");
+    const name = safeName(req.query.name || req.body?.name);
 
     if (!name) return res.status(400).json({ ok: false, error: "name required" });
 
     const clientPath = resolveInside(CLIENTS_DIR, client);
     ensureDir(clientPath);
 
-    // Trash base: 05 Downloads/_Trash
     const trashBase = resolveInside(clientPath, path.join("05 Downloads", "_Trash"));
+    ensureDir(trashBase);
 
-    // item lives in trash under same rel subpath
     const trashSub = rel ? resolveInside(trashBase, rel) : trashBase;
     const trashedFull = resolveInside(trashSub, name);
 
@@ -656,11 +644,10 @@ app.post("/api/clients/:client/restore", (req, res) => {
       return res.status(404).json({ ok: false, error: "Item not found in Trash" });
     }
 
-    // Restore destination: client root + rel
     const toDir = rel ? resolveInside(clientPath, rel) : clientPath;
     ensureDir(toDir);
 
-    // If destination already exists, rename restored item
+    // If destination exists, rename restored item
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
     let destName = name;
     let destFull = resolveInside(toDir, destName);
@@ -672,7 +659,6 @@ app.post("/api/clients/:client/restore", (req, res) => {
       destFull = resolveInside(toDir, destName);
     }
 
-    // Move back (fast) with fallback to copy+delete
     try {
       fs.renameSync(trashedFull, destFull);
     } catch {
@@ -680,12 +666,11 @@ app.post("/api/clients/:client/restore", (req, res) => {
       removeRecursiveSync(trashedFull);
     }
 
-    // Optional: clean up empty trash subfolder chain (best-effort)
+    // Clean up empty trash subfolders (best effort)
     try {
       if (rel) {
         let cur = trashSub;
-        const trashRoot = trashBase;
-        while (cur.startsWith(trashRoot) && cur !== trashRoot) {
+        while (cur.startsWith(trashBase) && cur !== trashBase) {
           const entries = fs.readdirSync(cur);
           if (entries.length > 0) break;
           fs.rmdirSync(cur);
@@ -702,6 +687,53 @@ app.post("/api/clients/:client/restore", (req, res) => {
       restoredAs: destName,
       toPath: rel,
     });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// 🧨 Empty Trash (hard delete) - FILES + FOLDERS
+// DELETE /api/clients/:client/trash?path=...
+// If path is empty => empties entire 05 Downloads/_Trash
+app.delete("/api/clients/:client/trash", (req, res) => {
+  try {
+    const client = safeName(req.params.client);
+    const rel = normalizeRelPath(req.query.path || "");
+
+    const clientPath = resolveInside(CLIENTS_DIR, client);
+    ensureDir(clientPath);
+
+    const trashBase = resolveInside(clientPath, path.join("05 Downloads", "_Trash"));
+    ensureDir(trashBase);
+
+    const trashTarget = rel ? resolveInside(trashBase, rel) : trashBase;
+
+    if (!fs.existsSync(trashTarget)) {
+      return res.json({ ok: true, emptied: true, path: rel, note: "Trash folder did not exist" });
+    }
+
+    // delete everything inside trashTarget, keep the folder itself
+    const entries = fs.readdirSync(trashTarget);
+    for (const entry of entries) {
+      removeRecursiveSync(path.join(trashTarget, entry));
+    }
+
+    // clean up empty parent folders (best effort)
+    try {
+      if (rel) {
+        let cur = trashTarget;
+        while (cur.startsWith(trashBase) && cur !== trashBase) {
+          const curEntries = fs.readdirSync(cur);
+          if (curEntries.length > 0) break;
+          fs.rmdirSync(cur);
+          cur = path.dirname(cur);
+        }
+      }
+    } catch {
+      // ignore cleanup errors
+    }
+
+    return res.json({ ok: true, emptied: true, path: rel });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message });
   }
