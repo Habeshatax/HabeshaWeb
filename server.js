@@ -26,10 +26,8 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
 const corsOptions = {
   origin: (origin, cb) => {
     if (!origin) return cb(null, true);
-
     if (ALLOWED_ORIGINS.length === 0) return cb(null, true);
     if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-
     return cb(new Error("CORS blocked for origin: " + origin));
   },
   credentials: true,
@@ -51,10 +49,15 @@ const AUTH_TOKEN = (process.env.AUTH_TOKEN || "").trim();
 const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || "").trim().toLowerCase();
 const ADMIN_PASSWORD = (process.env.ADMIN_PASSWORD || "").trim();
 
-// Client credentials (single client for now)
+// (Legacy single client fallback)
 const CLIENT_EMAIL = (process.env.CLIENT_EMAIL || "").trim().toLowerCase();
 const CLIENT_PASSWORD = (process.env.CLIENT_PASSWORD || "").trim();
-const CLIENT_NAME = (process.env.CLIENT_NAME || "").trim(); // must match folder name under /clients
+const CLIENT_NAME = (process.env.CLIENT_NAME || "").trim();
+
+// ✅ New: multiple client users via JSON
+// Example:
+// CLIENT_USERS_JSON=[{"email":"a@x.com","password":"123","client":"Client A"},{"email":"b@x.com","password":"456","client":"Client B"}]
+const CLIENT_USERS_JSON = (process.env.CLIENT_USERS_JSON || "").trim();
 
 // JWT secret
 const JWT_SECRET = (process.env.JWT_SECRET || "").trim();
@@ -147,6 +150,48 @@ function removeRecursiveSync(target) {
 }
 
 // --------------------------
+// Build client user list
+// --------------------------
+function parseClientUsers() {
+  const users = [];
+
+  // 1) New JSON list
+  if (CLIENT_USERS_JSON) {
+    try {
+      const parsed = JSON.parse(CLIENT_USERS_JSON);
+      if (!Array.isArray(parsed)) throw new Error("CLIENT_USERS_JSON must be a JSON array");
+
+      for (const u of parsed) {
+        const email = String(u?.email || "").trim().toLowerCase();
+        const password = String(u?.password || "").trim();
+        const client = String(u?.client || "").trim();
+
+        if (!email || !password || !client) continue;
+        users.push({ email, password, client: safeName(client) });
+      }
+    } catch (e) {
+      console.error("❌ Failed to parse CLIENT_USERS_JSON:", e.message);
+    }
+  }
+
+  // 2) Legacy single-client fallback
+  if (CLIENT_EMAIL && CLIENT_PASSWORD && CLIENT_NAME) {
+    users.push({
+      email: CLIENT_EMAIL,
+      password: CLIENT_PASSWORD,
+      client: safeName(CLIENT_NAME),
+    });
+  }
+
+  // de-duplicate by email
+  const map = new Map();
+  for (const u of users) map.set(u.email, u);
+  return Array.from(map.values());
+}
+
+const CLIENT_USERS = parseClientUsers();
+
+// --------------------------
 // AUTH middleware
 // --------------------------
 
@@ -196,8 +241,7 @@ const CLIENT_WRITE_ROOTS = ["05 Downloads", "03 Work"];
 
 function isAllowedClientWrite(rel) {
   const r = normalizeRelPath(rel || "");
-  if (!r) return false; // writing at client root => no
-
+  if (!r) return false;
   return CLIENT_WRITE_ROOTS.some((root) => r === root || r.startsWith(root + "/"));
 }
 
@@ -205,10 +249,7 @@ function requireWriteAccess(req, res, next) {
   const role = req.user?.role || "admin";
   if (role === "admin") return next();
 
-  // For trash/restore/delete-in-trash, `path` represents original folder rel path mirrored under _Trash
-  // For normal writes, `path` is the normal folder path
   const rel = normalizeRelPath(req.query.path || "");
-
   if (!isAllowedClientWrite(rel)) {
     return res.status(403).json({
       ok: false,
@@ -229,6 +270,7 @@ app.get("/api/health", (req, res) =>
     service: "habeshaweb",
     baseDir: BASE_DIR,
     clientsDir: CLIENTS_DIR,
+    clientUsers: CLIENT_USERS.map((u) => ({ email: u.email, client: u.client })), // safe: no passwords
   })
 );
 
@@ -260,30 +302,30 @@ app.post("/login", (req, res) => {
 });
 
 // ----- Client Login (PUBLIC) -----
+// POST /client-login { email, password }
 app.post("/client-login", (req, res) => {
   try {
     const email = String(req.body?.email || "").trim().toLowerCase();
     const password = String(req.body?.password || "").trim();
 
-    if (!CLIENT_EMAIL || !CLIENT_PASSWORD || !CLIENT_NAME) {
+    if (!JWT_SECRET) return res.status(500).json({ ok: false, error: "JWT_SECRET not set on server" });
+
+    if (!CLIENT_USERS.length) {
       return res.status(500).json({
         ok: false,
-        error: "CLIENT_EMAIL / CLIENT_PASSWORD / CLIENT_NAME not set on server",
+        error: "No client users configured. Set CLIENT_USERS_JSON (recommended) or CLIENT_EMAIL/CLIENT_PASSWORD/CLIENT_NAME",
       });
     }
 
-    if (email !== CLIENT_EMAIL || password !== CLIENT_PASSWORD) {
-      return res.status(401).json({ ok: false, error: "Invalid login" });
-    }
+    const match = CLIENT_USERS.find((u) => u.email === email && u.password === password);
+    if (!match) return res.status(401).json({ ok: false, error: "Invalid login" });
 
-    if (!JWT_SECRET) return res.status(500).json({ ok: false, error: "JWT_SECRET not set on server" });
-
-    // Ensure their folder exists (optional safety)
-    const clientFolder = safeName(CLIENT_NAME);
+    // ensure folder exists (best effort)
+    const clientFolder = safeName(match.client);
     const clientPath = resolveInside(CLIENTS_DIR, clientFolder);
     ensureDir(clientPath);
 
-    const user = { id: "client", email: CLIENT_EMAIL, role: "client", client: clientFolder };
+    const user = { id: "client", email: match.email, role: "client", client: clientFolder };
     const token = jwt.sign(user, JWT_SECRET, { expiresIn: "7d" });
 
     return res.json({ ok: true, token, user });
@@ -520,7 +562,7 @@ app.post("/api/clients/:client/trash", enforceClientMatch, requireWriteAccess, (
   }
 });
 
-// ♻️ Restore from Trash (write — restoring back into original folder)
+// ♻️ Restore from Trash (write)
 app.post("/api/clients/:client/restore", enforceClientMatch, requireWriteAccess, (req, res) => {
   try {
     const client = safeName(req.params.client);
@@ -563,26 +605,13 @@ app.post("/api/clients/:client/restore", enforceClientMatch, requireWriteAccess,
       removeRecursiveSync(trashedFull);
     }
 
-    // cleanup empty folders up to trash root
-    try {
-      if (rel) {
-        let cur = trashSub;
-        while (cur.startsWith(trashBase) && cur !== trashBase) {
-          const entries = fs.readdirSync(cur);
-          if (entries.length > 0) break;
-          fs.rmdirSync(cur);
-          cur = path.dirname(cur);
-        }
-      }
-    } catch {}
-
     return res.json({ ok: true, restored: name, restoredAs: destName, toPath: rel });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// 🧨 Empty Trash (write — destructive)
+// 🧨 Empty Trash (write)
 app.delete("/api/clients/:client/trash", enforceClientMatch, requireWriteAccess, (req, res) => {
   try {
     const client = safeName(req.params.client);
@@ -604,26 +633,13 @@ app.delete("/api/clients/:client/trash", enforceClientMatch, requireWriteAccess,
       removeRecursiveSync(path.join(trashTarget, entry));
     }
 
-    // cleanup empty parents (best effort)
-    try {
-      if (rel) {
-        let cur = trashTarget;
-        while (cur.startsWith(trashBase) && cur !== trashBase) {
-          const curEntries = fs.readdirSync(cur);
-          if (curEntries.length > 0) break;
-          fs.rmdirSync(cur);
-          cur = path.dirname(cur);
-        }
-      }
-    } catch {}
-
     return res.json({ ok: true, emptied: true, path: rel });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// ❌ Delete ONE item from Trash permanently (write — destructive)
+// ❌ Delete ONE item from Trash permanently (write)
 app.delete("/api/clients/:client/trashItem", enforceClientMatch, requireWriteAccess, (req, res) => {
   try {
     const client = safeName(req.params.client);
@@ -645,19 +661,6 @@ app.delete("/api/clients/:client/trashItem", enforceClientMatch, requireWriteAcc
 
     removeRecursiveSync(itemFull);
 
-    // cleanup empty folders up to trash root
-    try {
-      if (rel) {
-        let cur = trashSub;
-        while (cur.startsWith(trashBase) && cur !== trashBase) {
-          const entries = fs.readdirSync(cur);
-          if (entries.length > 0) break;
-          fs.rmdirSync(cur);
-          cur = path.dirname(cur);
-        }
-      }
-    } catch {}
-
     return res.json({ ok: true, deleted: name, path: rel });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message });
@@ -665,32 +668,36 @@ app.delete("/api/clients/:client/trashItem", enforceClientMatch, requireWriteAcc
 });
 
 // Hard delete file (admin only)
-app.delete("/api/clients/:client/file", enforceClientMatch, (req, res, next) => {
-  // client users are not allowed to use hard delete file directly
-  if ((req.user?.role || "") === "client") {
-    return res.status(403).json({ ok: false, error: "Forbidden (use Trash / Delete in Trash)" });
+app.delete(
+  "/api/clients/:client/file",
+  enforceClientMatch,
+  (req, res, next) => {
+    if ((req.user?.role || "") === "client") {
+      return res.status(403).json({ ok: false, error: "Forbidden (use Trash / Delete in Trash)" });
+    }
+    return next();
+  },
+  (req, res) => {
+    try {
+      const client = safeName(req.params.client);
+      const file = String(req.query.file || "");
+      const rel = normalizeRelPath(req.query.path || "");
+      if (!file) return res.status(400).json({ ok: false, error: "file query required" });
+
+      const clientPath = resolveInside(CLIENTS_DIR, client);
+      const targetDir = rel ? resolveInside(clientPath, rel) : clientPath;
+      const full = resolveInside(targetDir, file);
+
+      if (!fs.existsSync(full)) return res.status(404).json({ ok: false, error: "Not found" });
+      if (fs.statSync(full).isDirectory()) return res.status(400).json({ ok: false, error: "Not a file" });
+
+      fs.unlinkSync(full);
+      res.json({ ok: true, deleted: file, path: rel });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e.message });
+    }
   }
-  return next();
-}, (req, res) => {
-  try {
-    const client = safeName(req.params.client);
-    const file = String(req.query.file || "");
-    const rel = normalizeRelPath(req.query.path || "");
-    if (!file) return res.status(400).json({ ok: false, error: "file query required" });
-
-    const clientPath = resolveInside(CLIENTS_DIR, client);
-    const targetDir = rel ? resolveInside(clientPath, rel) : clientPath;
-    const full = resolveInside(targetDir, file);
-
-    if (!fs.existsSync(full)) return res.status(404).json({ ok: false, error: "Not found" });
-    if (fs.statSync(full).isDirectory()) return res.status(400).json({ ok: false, error: "Not a file" });
-
-    fs.unlinkSync(full);
-    res.json({ ok: true, deleted: file, path: rel });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
+);
 
 // ----- Start -----
 app.listen(PORT, "0.0.0.0", () => {
@@ -701,9 +708,8 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`AUTH_TOKEN set: ${AUTH_TOKEN ? "YES" : "NO"}`);
   console.log(`JWT_SECRET set: ${JWT_SECRET ? "YES" : "NO"}`);
   console.log(`ADMIN_EMAIL set: ${ADMIN_EMAIL ? "YES" : "NO"}`);
-  console.log(`CLIENT_EMAIL set: ${CLIENT_EMAIL ? "YES" : "NO"}`);
-  console.log(`CLIENT_NAME set: ${CLIENT_NAME ? CLIENT_NAME : "(not set)"}`);
   console.log(`BASE_DIR: ${BASE_DIR}`);
   console.log(`CLIENTS_DIR: ${CLIENTS_DIR}`);
   console.log(`CLIENT_WRITE_ROOTS: ${CLIENT_WRITE_ROOTS.join(", ")}`);
+  console.log(`CLIENT_USERS configured: ${CLIENT_USERS.length}`);
 });
