@@ -18,7 +18,7 @@ base := "C:\Users\wedaj\OneDrive\Documents\Habesha"
 clientsBase := base "\02 Clients"
 taxYearsFile := base "\_settings_taxyears.txt"
 
-; Signature settings
+; Signature formatting in Word
 SIGN_NAME := "Liyou Wedaj Birhane"
 SIGN_FONT := "Brush Script MT"
 SIGN_SIZE := 26
@@ -34,7 +34,7 @@ folders := Map(
 )
 
 ; =========================
-; GUI
+; GUI (Main)
 ; =========================
 gui1 := Gui("+AlwaysOnTop -MaximizeBox -MinimizeBox", "Habesha Folders")
 gui1.SetFont("s10", "Segoe UI")
@@ -84,7 +84,6 @@ TodayISO() {
   return FormatTime(A_Now, "yyyy-MM-dd")
 }
 
-; ---- Sorting helper (works even if Array.Sort() not available) ----
 JoinArray(arr, delim := "`n") {
   out := ""
   for i, v in arr
@@ -157,8 +156,12 @@ EnsureBaseStructure(showMsg := false) {
 }
 
 OpenFolderBtn(btn, *) {
-  EnsureDir(btn.Path)
-  Run(btn.Path)
+  try {
+    EnsureDir(btn.Path)
+    Run(btn.Path)
+  } catch as e {
+    MsgBox("Could not open folder:`n" btn.Path "`n`n" e.Message)
+  }
 }
 
 ; =========================
@@ -225,7 +228,7 @@ ReadClientFlags(clientFolder) {
 SetClientInfo(clientFolder, clientType, bk, vat, paye, mtd, sa, ho, directors, extra) {
   p := ClientInfoFile(clientFolder)
   name := RegExReplace(clientFolder, "^.*\\", "")
-  created := GetRegistrationDate(clientFolder) ; keep original registration date
+  created := GetRegistrationDate(clientFolder) ; keep original
 
   content :=
 (
@@ -349,7 +352,9 @@ ApplyNewStructureToAllClients(*) {
   if !AskYesNo("This will create missing folders for ALL clients under:`n" clientsBase "`n`nContinue?", "Apply Structure")
     return
 
-  count := 0, processed := 0
+  count := 0
+  processed := 0
+
   loop files clientsBase "\*", "D" {
     count++
     clientPath := clientsBase "\" A_LoopFileName
@@ -365,6 +370,7 @@ ApplyNewStructureToAllClients(*) {
 
     processed++
   }
+
   MsgBox("Done ✅`nClients found: " count "`nClients processed: " processed)
 }
 
@@ -499,7 +505,7 @@ NewOtherClient(*) {
 }
 
 ; =========================
-; UPDATE REGISTRATION GUI (FIXED checkbox values)
+; UPDATE REGISTRATION GUI
 ; =========================
 UpdateClientRegistration(*) {
   global clientsBase, taxYears
@@ -538,7 +544,7 @@ UpdateClientRegistration(*) {
   btnOpen := g.Add("Button", "x+10 w180 h34", "Open Client Folder")
   btnCancel := g.Add("Button", "x+10 w180 h34", "Cancel")
 
-  LoadUIFromClient() {
+  LoadUIFromClient(*) {
     clientName := ddlClient.Text
     clientPath := clientsBase "\" clientName
     f := ReadClientFlags(clientPath)
@@ -546,7 +552,6 @@ UpdateClientRegistration(*) {
     ddlType.Text := f["type"]
     edDirectors.Text := f["directors"]
 
-    ; FIX: force numeric 0/1
     cbBK.Value   := f["bk"]    ? 1 : 0
     cbVAT.Value  := f["vat"]   ? 1 : 0
     cbPAYE.Value := f["paye"]  ? 1 : 0
@@ -558,73 +563,118 @@ UpdateClientRegistration(*) {
     edDirectors.Enabled := (ddlType.Text = "Limited Company")
   }
 
-  ddlClient.OnEvent("Change", (*) => LoadUIFromClient())
+  SaveChanges(*) {
+    clientName := ddlClient.Text
+    clientPath := clientsBase "\" clientName
+
+    ct := ddlType.Text
+    bk := (cbBK.Value = 1)
+    vat := (cbVAT.Value = 1)
+    paye := (cbPAYE.Value = 1)
+    mtd := (cbMTD.Value = 1)
+    sa := (cbSA.Value = 1)
+    ho := (cbHO.Value = 1)
+    ex := (cbEX.Value = 1)
+
+    d := RegExReplace(Trim(edDirectors.Text), "[^0-9]", "")
+    directors := (d = "" ? 1 : (d + 0))
+    if (directors < 1)
+      directors := 1
+
+    CreateCoreClientFolders(clientPath)
+    SetClientInfo(clientPath, ct, bk, vat, paye, mtd, sa, ho, directors, ex)
+
+    if (sa)
+      CreateSelfAssessmentStructure(clientPath, taxYears)
+    if (ct = "Limited Company")
+      CreateLimitedCompanyStructure(clientPath, taxYears, vat, paye)
+    if (ho)
+      CreateHomeOfficeStructure(clientPath)
+
+    MsgBox("Saved ✅`n`nRegistration updated for: " clientName)
+  }
+
+  ddlClient.OnEvent("Change", LoadUIFromClient)
   ddlType.OnEvent("Change", (*) => (edDirectors.Enabled := (ddlType.Text = "Limited Company")))
   btnOpen.OnEvent("Click", (*) => Run(clientsBase "\" ddlClient.Text))
   btnCancel.OnEvent("Click", (*) => g.Destroy())
-
-  btnSave.OnEvent("Click", (*) => (
-    clientName := ddlClient.Text,
-    clientPath := clientsBase "\" clientName,
-    CreateCoreClientFolders(clientPath),
-
-    ct := ddlType.Text,
-    bk := cbBK.Value = 1,
-    vat := cbVAT.Value = 1,
-    paye := cbPAYE.Value = 1,
-    mtd := cbMTD.Value = 1,
-    sa := cbSA.Value = 1,
-    ho := cbHO.Value = 1,
-    ex := cbEX.Value = 1,
-
-    d := RegExReplace(Trim(edDirectors.Text), "[^0-9]", ""),
-    directors := (d = "" ? 1 : (d + 0)),
-    directors := (directors < 1 ? 1 : directors),
-
-    SetClientInfo(clientPath, ct, bk, vat, paye, mtd, sa, ho, directors, ex),
-
-    (sa ? CreateSelfAssessmentStructure(clientPath, taxYears) : 0),
-    (ct = "Limited Company" ? CreateLimitedCompanyStructure(clientPath, taxYears, vat, paye) : 0),
-    (ho ? CreateHomeOfficeStructure(clientPath) : 0),
-
-    MsgBox("Saved ✅`n`nRegistration updated for: " clientName)
-  ))
+  btnSave.OnEvent("Click", SaveChanges)
 
   LoadUIFromClient()
   g.Show("AutoSize")
 }
 
 ; =========================
-; ENGAGEMENT LETTER (simple RTF only – safe)
-; NOTE: Word/PDF automation removed here to avoid stopping.
-; If you want Word/PDF back, tell me and I’ll re-add it safely.
+; ENGAGEMENT LETTER (FULL + service wording matches client type)
+; Generates DOCX + PDF via Word
 ; =========================
-EngagementLetterText(clientName, clientType, bk, vat, paye, mtd, feeText, paymentTerms, regDateISO, directors := 1, extra := false) {
-  services := ""
-  services .= "• Bookkeeping: " (bk ? "Yes" : "No") "`r`n"
-  services .= "• VAT: " (vat ? "Yes" : "No") "`r`n"
-  services .= "• Payroll (PAYE): " (paye ? "Yes" : "No") "`r`n"
-  services .= "• MTD (ITSA): " (mtd ? "Yes" : "No") "`r`n"
-  services .= "• Self Assessment: " (clientType="Limited Company" ? "No" : "As agreed") "`r`n"
-  services .= "• Home Office Applications: " (extra ? "As agreed" : "No") "`r`n"
-  if (clientType = "Limited Company")
-    services .= "• Directors: " directors "`r`n"
+ServiceWording(clientType, bk, vat, paye, mtd, sa, ho, extra, directors := 1) {
+  s := ""
+
+  if (clientType = "Limited Company") {
+    s .= "• Corporation Tax return and statutory accounts: As agreed`r`n"
+    s .= "• Companies House support (confirmation statement / filing support): As agreed`r`n"
+    s .= "• Directors (" directors "): Included for year-end/ payroll coordination`r`n"
+  } else if (clientType = "Landlord") {
+    s .= "• Self Assessment (property income): " (sa ? "As agreed" : "No") "`r`n"
+    s .= "• Rental income & expense schedule support: " (sa ? "As agreed" : "No") "`r`n"
+  } else if (clientType = "Self-Employed") {
+    s .= "• Self Assessment (sole trader): " (sa ? "As agreed" : "No") "`r`n"
+  } else {
+    s .= "• General advisory / support services: As agreed`r`n"
+  }
+
+  ; Common add-ons
+  s .= "• Bookkeeping & bank reconciliation: " (bk ? "As agreed" : "No") "`r`n"
+  s .= "• VAT / MTD VAT returns: " (vat ? "As agreed" : "No") "`r`n"
+  s .= "• Payroll (PAYE/RTI), payslips, P60/P45: " (paye ? "As agreed" : "No") "`r`n"
+  s .= "• MTD for Income Tax (ITSA): " (mtd ? "As agreed" : "No") "`r`n"
+  s .= "• Home Office applications (forms + supporting documents): " (ho ? "As agreed" : "No") "`r`n"
+  s .= "• Other extra service: " (extra ? "As agreed" : "No") "`r`n"
+
+  return s
+}
+
+EngagementLetterText(clientName, clientType, bk, vat, paye, mtd, sa, ho, feeText, paymentTerms, regDateISO, directors := 1, extra := false) {
+  global SIGN_NAME
+  services := ServiceWording(clientType, bk, vat, paye, mtd, sa, ho, extra, directors)
 
   return
 (
-"HABESHA TAX & SUPPORT LTD" "`r`n"
-"ENGAGEMENT LETTER" "`r`n"
-"=====================================" "`r`n"
-"" "`r`n"
+"HABESHA TAX & SUPPORT LTD`r`n"
+"ENGAGEMENT LETTER`r`n"
+"=====================================`r`n"
+"`r`n"
 "Client Name: " clientName "`r`n"
 "Client Type: " clientType "`r`n"
 "Date of registration: " regDateISO "`r`n"
-"" "`r`n"
+"`r`n"
+"1) Purpose`r`n"
+"This letter confirms the scope of services agreed between the Client and Habesha Tax & Support Ltd (the Advisor).`r`n"
+"`r`n"
+"2) Scope of services (as agreed)`r`n"
+services
+"`r`n"
+"3) Client responsibilities`r`n"
+"• Provide complete and accurate information on time`r`n"
+"• Keep and provide records and supporting documents`r`n"
+"• Review drafts and confirm approval before submission/filing`r`n"
+"`r`n"
+"4) Advisor responsibilities`r`n"
+"• Prepare agreed work using the information supplied`r`n"
+"• Keep your information confidential and secure`r`n"
+"• Contact you if clarification or additional information is required`r`n"
+"`r`n"
+"5) Fees and payment`r`n"
 "Fee agreed: " feeText "`r`n"
 "Payment terms: " paymentTerms "`r`n"
-"" "`r`n"
-"7) Signatures" "`r`n"
-"Client signature: ______________________    Date: __________" "`r`n"
+"`r`n"
+"6) Important notes`r`n"
+"• We are not responsible for penalties/interest caused by late or missing information from the Client`r`n"
+"• If your circumstances change (e.g. VAT registration, payroll start), you must inform us immediately`r`n"
+"`r`n"
+"7) Signatures`r`n"
+"Client signature: ______________________    Date: __________`r`n"
 "Habesha Tax & Support Ltd: " SIGN_NAME "    Date: " regDateISO "`r`n"
 )
 }
@@ -642,35 +692,83 @@ PromptFeeInfo(clientName := "") {
 
   g.Add("Text", "y+10", "Payment type:")
   ddl := g.Add("DropDownList", "w260 Choose1", ["One-off", "Monthly Direct Debit"])
+
   g.Add("Text", "y+10", "DD collection day (optional, 1-28):")
   edDay := g.Add("Edit", "w80", "")
 
   result := false
+
   btnOk := g.Add("Button", "y+16 w240 Default", "OK")
   btnCancel := g.Add("Button", "x+40 w240", "Cancel")
 
   btnCancel.OnEvent("Click", (*) => g.Destroy())
+
   btnOk.OnEvent("Click", (*) => (
     feeRaw := Trim(edFee.Text),
-    (feeRaw = "" ? MsgBox("Please enter a fee amount.") : (
-      feeNum := RegExReplace(feeRaw, "[^0-9\\.]", ""),
-      feeNum := (feeNum = "" ? feeRaw : feeNum),
-      payType := ddl.Text,
-      day := RegExReplace(Trim(edDay.Text), "[^0-9]", ""),
-      feeText := (InStr(feeRaw, "£") ? feeRaw : "£" feeNum),
-      paymentTerms := (payType = "One-off")
-        ? "One-off payment (due on engagement / as agreed)."
-        : ((day != "" && (day+0) >= 1 && (day+0) <= 28)
-            ? "Monthly Direct Debit, collected on day " day " of each month."
-            : "Monthly Direct Debit."),
-      result := { feeText: feeText, paymentTerms: paymentTerms },
-      g.Destroy()
-    ))
+    feeRaw = ""
+      ? MsgBox("Please enter a fee amount.")
+      : (
+          feeNum := RegExReplace(feeRaw, "[^0-9\\.]", ""),
+          feeNum := (feeNum = "" ? feeRaw : feeNum),
+          payType := ddl.Text,
+          day := RegExReplace(Trim(edDay.Text), "[^0-9]", ""),
+          feeText := (InStr(feeRaw, "£") ? feeRaw : "£" feeNum),
+          paymentTerms := (payType = "One-off")
+            ? "One-off payment (due on engagement / as agreed)."
+            : ((day != "" && (day+0) >= 1 && (day+0) <= 28)
+                ? "Monthly Direct Debit, collected on day " day " of each month."
+                : "Monthly Direct Debit."),
+          result := { feeText: feeText, paymentTerms: paymentTerms },
+          g.Destroy()
+        )
   ))
 
   g.Show("AutoSize")
   WinWaitClose("Agreed Fee")
   return result
+}
+
+; Create DOCX + PDF from plain text using Word
+SaveWordAndPdfFromText(text, docxPath, pdfPath) {
+  global SIGN_NAME, SIGN_FONT, SIGN_SIZE
+  word := ""
+  doc := ""
+  try {
+    word := ComObject("Word.Application")
+    word.Visible := false
+    doc := word.Documents.Add()
+    doc.Content.Text := text
+
+    ; Basic formatting (optional)
+    doc.Content.Font.Name := "Calibri"
+    doc.Content.Font.Size := 11
+
+    ; Make title bold (first lines)
+    rng := doc.Range(0, 0)
+    rng.SetRange(0, 0) ; no-op safety
+
+    ; Style signature name
+    r := doc.Content
+    r.Find.ClearFormatting()
+    r.Find.Text := SIGN_NAME
+    if (r.Find.Execute()) {
+      r.Font.Name := SIGN_FONT
+      r.Font.Size := SIGN_SIZE
+    }
+
+    ; Save
+    doc.SaveAs2(docxPath, 16) ; wdFormatXMLDocument
+    doc.ExportAsFixedFormat(pdfPath, 17) ; wdExportFormatPDF
+
+    doc.Close(false)
+    word.Quit()
+    return true
+  } catch as e {
+    try doc.Close(false)
+    try word.Quit()
+    MsgBox("Word/PDF generation failed.`n`nMake sure Microsoft Word is installed.`n`n" e.Message)
+    return false
+  }
 }
 
 GenerateEngagementLetterForClientPrompt(clientFolder, clientName := "") {
@@ -681,6 +779,8 @@ GenerateEngagementLetterForClientPrompt(clientFolder, clientName := "") {
 }
 
 GenerateEngagementLetterForClient(clientFolder, feeText, paymentTerms) {
+  global clientsBase
+
   clientName := RegExReplace(clientFolder, "^.*\\", "")
   f := ReadClientFlags(clientFolder)
 
@@ -688,17 +788,36 @@ GenerateEngagementLetterForClient(clientFolder, feeText, paymentTerms) {
   EnsureDir(target)
 
   regDate := GetRegistrationDate(clientFolder)
-  content := EngagementLetterText(clientName, f["type"], f["bk"], f["vat"], f["paye"], f["mtd"], feeText, paymentTerms, regDate, f["directors"], f["extra"])
 
-  rtf := target "\Engagement Letter - Template.rtf"
-  WriteTextFile(rtf, content)
-  MsgBox("Engagement letter saved (RTF):`n" rtf)
+  content := EngagementLetterText(
+    clientName,
+    f["type"],
+    f["bk"], f["vat"], f["paye"], f["mtd"],
+    f["sa"], f["ho"],
+    feeText, paymentTerms, regDate,
+    f["directors"], f["extra"]
+  )
+
+  docx := target "\Engagement Letter - " clientName " - " regDate ".docx"
+  pdf  := target "\Engagement Letter - " clientName " - " regDate ".pdf"
+
+  ok := SaveWordAndPdfFromText(content, docx, pdf)
+  if (ok) {
+    MsgBox("Engagement letter saved:`n`n" docx "`n" pdf)
+  } else {
+    ; fallback: save txt if Word fails
+    txt := target "\Engagement Letter - " clientName " - " regDate ".txt"
+    WriteTextFile(txt, content)
+    MsgBox("Saved as TXT only (Word failed):`n" txt)
+  }
+
   Run(target)
 }
 
 GenerateEngagementLetterUI(*) {
+  global clientsBase
   list := GetClientList()
-  if list.Length = 0 {
+  if (list.Length = 0) {
     MsgBox("No clients found.")
     return
   }

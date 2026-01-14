@@ -616,6 +616,97 @@ app.post("/api/clients/:client/trash", (req, res) => {
   }
 });
 
+/**
+ * ♻️ Restore from Trash (FILES + FOLDERS)
+ *
+ * POST /api/clients/:client/restore
+ * query: ?path=<originalRelativePathInsideClient>&name=<trashedNameInTrash>
+ *
+ * Example:
+ *   restore a trashed file that was originally in "02 Compliance/01 Self Assessment"
+ *   and is currently in trash under the same subpath:
+ *
+ *   POST /api/clients/ClientName/restore?path=02%20Compliance/01%20Self%20Assessment&name=file.pdf
+ *
+ * Notes:
+ * - Trash stores items inside: 05 Downloads/_Trash/<path>/<name>
+ * - Restore moves it back to: <clientRoot>/<path>/<name>
+ * - If destination already exists, we auto-rename restored item with timestamp suffix.
+ * - Uses rename first, then copy+delete fallback (same as trash).
+ */
+app.post("/api/clients/:client/restore", (req, res) => {
+  try {
+    const client = safeName(req.params.client);
+    const rel = normalizeRelPath(req.query.path || ""); // original folder relative path
+    const name = safeName(req.query.name || req.body?.name); // allow either query or body
+
+    if (!name) return res.status(400).json({ ok: false, error: "name required" });
+
+    const clientPath = resolveInside(CLIENTS_DIR, client);
+    ensureDir(clientPath);
+
+    // Trash base: 05 Downloads/_Trash
+    const trashBase = resolveInside(clientPath, path.join("05 Downloads", "_Trash"));
+
+    // item lives in trash under same rel subpath
+    const trashSub = rel ? resolveInside(trashBase, rel) : trashBase;
+    const trashedFull = resolveInside(trashSub, name);
+
+    if (!fs.existsSync(trashedFull)) {
+      return res.status(404).json({ ok: false, error: "Item not found in Trash" });
+    }
+
+    // Restore destination: client root + rel
+    const toDir = rel ? resolveInside(clientPath, rel) : clientPath;
+    ensureDir(toDir);
+
+    // If destination already exists, rename restored item
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    let destName = name;
+    let destFull = resolveInside(toDir, destName);
+
+    if (fs.existsSync(destFull)) {
+      const ext = path.extname(name);
+      const baseName = ext ? path.basename(name, ext) : name;
+      destName = `${baseName}__restored__${stamp}${ext || ""}`;
+      destFull = resolveInside(toDir, destName);
+    }
+
+    // Move back (fast) with fallback to copy+delete
+    try {
+      fs.renameSync(trashedFull, destFull);
+    } catch {
+      copyRecursiveSync(trashedFull, destFull);
+      removeRecursiveSync(trashedFull);
+    }
+
+    // Optional: clean up empty trash subfolder chain (best-effort)
+    try {
+      if (rel) {
+        let cur = trashSub;
+        const trashRoot = trashBase;
+        while (cur.startsWith(trashRoot) && cur !== trashRoot) {
+          const entries = fs.readdirSync(cur);
+          if (entries.length > 0) break;
+          fs.rmdirSync(cur);
+          cur = path.dirname(cur);
+        }
+      }
+    } catch {
+      // ignore cleanup errors
+    }
+
+    return res.json({
+      ok: true,
+      restored: name,
+      restoredAs: destName,
+      toPath: rel,
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // Hard delete file (still file-only)
 app.delete("/api/clients/:client/file", (req, res) => {
   try {
