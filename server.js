@@ -15,24 +15,34 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // ----- Middleware -----
+app.use(express.json({ limit: "25mb" }));
+
+// ----- CORS -----
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
-app.use(
-  cors({
-    origin: (origin, cb) => {
-      if (!origin) return cb(null, true); // allow tools like curl/PS
-      if (ALLOWED_ORIGINS.length === 0) return cb(null, true);
-      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-      return cb(new Error("CORS blocked for origin: " + origin));
-    },
-    credentials: true,
-  })
-);
+const corsOptions = {
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true); // allow curl/Postman/server-to-server
 
-app.use(express.json({ limit: "25mb" }));
+    if (ALLOWED_ORIGINS.length === 0) {
+      return cb(null, true); // allow all (testing)
+    }
+
+    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+
+    return cb(new Error("CORS blocked for origin: " + origin));
+  },
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  maxAge: 86400,
+};
+
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions)); // ✅ handle preflight
 
 // ----- Config -----
 const PORT = process.env.PORT || 8787;
@@ -59,7 +69,6 @@ function ensureDir(p) {
 }
 
 function safeName(input) {
-  // allow letters, numbers, dot, underscore, dash, space
   return String(input || "")
     .trim()
     .replace(/[^a-zA-Z0-9._ -]/g, "_")
@@ -93,7 +102,6 @@ function verifyJwtToken(token) {
 
 // Protect only /api routes
 function requireAuth(req, res, next) {
-  // If no auth configured, do not lock yourself out
   if (!AUTH_TOKEN && !JWT_SECRET) return next();
 
   const token = getBearer(req);
@@ -115,29 +123,24 @@ function requireAuth(req, res, next) {
 }
 
 function normalizeRelPath(p) {
-  // allow empty -> root
   const raw = String(p || "").trim();
   if (!raw) return "";
 
-  // convert backslashes to forward slashes and remove leading slashes
   const cleaned = raw.replace(/\\/g, "/").replace(/^\/+/, "");
-
-  // block traversal + null byte
   const decoded = decodeURIComponent(cleaned);
+
   if (decoded.includes("..")) throw new Error("Invalid path");
   if (decoded.includes("\0")) throw new Error("Invalid path");
 
-  // remove duplicate slashes
   return decoded.replace(/\/{2,}/g, "/");
 }
 
 function getCurrentTaxYearLabel(now = new Date()) {
-  // UK tax year: 6 April -> 5 April
   const y = now.getFullYear();
   const april6 = new Date(y, 3, 6);
   const startYear = now >= april6 ? y : y - 1;
   const endYear = startYear + 1;
-  return `${startYear}-${String(endYear).slice(2)}`; // e.g. 2025-26
+  return `${startYear}-${String(endYear).slice(2)}`;
 }
 
 function createTaxYearTree(basePath, label) {
@@ -167,7 +170,6 @@ function createStandardClientRoot(clientPath) {
   ];
   roots.forEach((r) => ensureDir(path.join(clientPath, r)));
 
-  // Proof of ID subfolders
   const idBase = path.join(clientPath, "01 Proof of ID");
   ["01 Passport - BRP - eVisa", "02 Proof of Address", "03 Signed Engagement Letter"].forEach((s) =>
     ensureDir(path.join(idBase, s))
@@ -195,10 +197,8 @@ function createComplianceStructure(clientPath, businessType, services) {
   const type = normalizeBusinessType(businessType);
   const svc = normalizeServices(services);
 
-  // Always useful
   ensureDir(path.join(complianceBase, "00 Client Info"));
 
-  // --- Self Assessment ---
   if (svc.includes("self_assessment") || type === "self_assessment") {
     const sa = path.join(complianceBase, "01 Self Assessment");
     ensureDir(sa);
@@ -211,7 +211,6 @@ function createComplianceStructure(clientPath, businessType, services) {
     createTaxYearTree(sa, current);
   }
 
-  // --- Landlords ---
   if (svc.includes("landlords") || type === "landlords") {
     const ll = path.join(complianceBase, "02 Landlords");
     ensureDir(ll);
@@ -228,7 +227,6 @@ function createComplianceStructure(clientPath, businessType, services) {
     );
   }
 
-  // --- Limited Company ---
   if (svc.includes("limited_company") || type === "limited_company") {
     const ltd = path.join(complianceBase, "03 Limited Company");
     ensureDir(ltd);
@@ -250,7 +248,6 @@ function createComplianceStructure(clientPath, businessType, services) {
     ].forEach((s) => ensureDir(path.join(ltd, s)));
   }
 
-  // --- Bookkeeping ---
   if (svc.includes("bookkeeping")) {
     const bk = path.join(complianceBase, "04 Bookkeeping");
     ensureDir(bk);
@@ -259,7 +256,6 @@ function createComplianceStructure(clientPath, businessType, services) {
     );
   }
 
-  // --- VAT / MTD ---
   if (svc.includes("vat_mtd")) {
     const vat = path.join(complianceBase, "05 VAT (MTD)");
     ensureDir(vat);
@@ -268,7 +264,6 @@ function createComplianceStructure(clientPath, businessType, services) {
     );
   }
 
-  // --- Payroll ---
   if (svc.includes("payroll")) {
     const pr = path.join(complianceBase, "06 Payroll");
     ensureDir(pr);
@@ -283,7 +278,6 @@ function createComplianceStructure(clientPath, businessType, services) {
     ].forEach((s) => ensureDir(path.join(pr, s)));
   }
 
-  // --- Home Office ---
   if (svc.includes("home_office")) {
     const ho = path.join(complianceBase, "07 Home Office Applications");
     ensureDir(ho);
@@ -298,7 +292,6 @@ function createClientFolderTree(clientPath, businessType, services) {
   createComplianceStructure(clientPath, businessType, services);
 }
 
-// optional helper: auto add extension if user uploads without one
 function addExtIfMissing(fileName, contentType) {
   if (!fileName) return fileName;
   if (path.extname(fileName)) return fileName;
@@ -309,6 +302,39 @@ function addExtIfMissing(fileName, contentType) {
   if (ct.includes("jpeg") || ct.includes("jpg")) return `${fileName}.jpg`;
   if (ct.includes("text")) return `${fileName}.txt`;
   return fileName;
+}
+
+// ✅ Recursive copy (for folder trash fallback)
+function copyRecursiveSync(src, dest) {
+  const stat = fs.statSync(src);
+
+  if (stat.isDirectory()) {
+    ensureDir(dest);
+    for (const entry of fs.readdirSync(src)) {
+      const from = path.join(src, entry);
+      const to = path.join(dest, entry);
+      copyRecursiveSync(from, to);
+    }
+    return;
+  }
+
+  fs.copyFileSync(src, dest);
+}
+
+// ✅ Recursive delete (for folder trash fallback)
+function removeRecursiveSync(target) {
+  if (!fs.existsSync(target)) return;
+  const stat = fs.statSync(target);
+
+  if (stat.isDirectory()) {
+    for (const entry of fs.readdirSync(target)) {
+      removeRecursiveSync(path.join(target, entry));
+    }
+    fs.rmdirSync(target);
+    return;
+  }
+
+  fs.unlinkSync(target);
 }
 
 ensureDir(CLIENTS_DIR);
@@ -330,23 +356,18 @@ app.get("/", (req, res) => {
   res.status(200).send("HabeshaWeb backend is running. Try /health or /api/health");
 });
 
-// Helpful (so browser doesn't say Cannot GET /login)
 app.get("/login", (req, res) => {
   res.status(200).send("Use POST /login with JSON body { email, password }. This is an API endpoint.");
 });
 
 // ----- LOGIN (PUBLIC) -----
-// POST /login  body: { email, password }
 app.post("/login", (req, res) => {
   try {
     const email = String(req.body?.email || "").trim().toLowerCase();
     const password = String(req.body?.password || "").trim();
 
     if (!ADMIN_EMAIL || !ADMIN_PASSWORD) {
-      return res.status(500).json({
-        ok: false,
-        error: "ADMIN_EMAIL / ADMIN_PASSWORD not set on server",
-      });
+      return res.status(500).json({ ok: false, error: "ADMIN_EMAIL / ADMIN_PASSWORD not set on server" });
     }
 
     if (email !== ADMIN_EMAIL || password !== ADMIN_PASSWORD) {
@@ -354,10 +375,7 @@ app.post("/login", (req, res) => {
     }
 
     if (!JWT_SECRET) {
-      return res.status(500).json({
-        ok: false,
-        error: "JWT_SECRET not set on server",
-      });
+      return res.status(500).json({ ok: false, error: "JWT_SECRET not set on server" });
     }
 
     const user = { id: "admin", email: ADMIN_EMAIL, role: "admin" };
@@ -372,12 +390,8 @@ app.post("/login", (req, res) => {
 // ----- API (protected) -----
 app.use("/api", requireAuth);
 
-// ✅ /api/me
-app.get("/api/me", (req, res) => {
-  return res.json({ ok: true, user: req.user || null });
-});
+app.get("/api/me", (req, res) => res.json({ ok: true, user: req.user || null }));
 
-// List clients (folders)
 app.get("/api/clients", (req, res) => {
   try {
     const items = fs
@@ -392,8 +406,6 @@ app.get("/api/clients", (req, res) => {
   }
 });
 
-// ✅ Create client folder + FULL STRUCTURE
-// body: { name, businessType, services[] }
 app.post("/api/clients", (req, res) => {
   try {
     const name = safeName(req.body?.name);
@@ -403,11 +415,9 @@ app.post("/api/clients", (req, res) => {
     const services = normalizeServices(req.body?.services || []);
 
     const clientPath = resolveInside(CLIENTS_DIR, name);
-
     const existed = fs.existsSync(clientPath);
-    ensureDir(clientPath);
 
-    // build folder tree (idempotent)
+    ensureDir(clientPath);
     createClientFolderTree(clientPath, businessType, services);
 
     res.json({ ok: true, client: name, created: !existed, businessType, services });
@@ -416,8 +426,6 @@ app.post("/api/clients", (req, res) => {
   }
 });
 
-// ✅ NEW: create folder (mkdir) (supports ?path=...)
-// body: { name }
 app.post("/api/clients/:client/mkdir", (req, res) => {
   try {
     const client = safeName(req.params.client);
@@ -441,8 +449,6 @@ app.post("/api/clients/:client/mkdir", (req, res) => {
   }
 });
 
-// ✅ NEW: write text file (supports ?path=...)
-// body: { fileName, text }
 app.post("/api/clients/:client/writeText", (req, res) => {
   try {
     const client = safeName(req.params.client);
@@ -461,18 +467,12 @@ app.post("/api/clients/:client/writeText", (req, res) => {
     const full = resolveInside(targetDir, fileName);
     fs.writeFileSync(full, text, "utf8");
 
-    res.json({
-      ok: true,
-      savedAs: fileName,
-      bytes: Buffer.byteLength(text, "utf8"),
-      path: rel,
-    });
+    res.json({ ok: true, savedAs: fileName, bytes: Buffer.byteLength(text, "utf8"), path: rel });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// ✅ List files/folders for a client (supports ?path=sub/folder)
 app.get("/api/clients/:client/files", (req, res) => {
   try {
     const client = safeName(req.params.client);
@@ -506,7 +506,6 @@ app.get("/api/clients/:client/files", (req, res) => {
   }
 });
 
-// ✅ Download a file (supports ?file=...&path=...)
 app.get("/api/clients/:client/download", (req, res) => {
   try {
     const client = safeName(req.params.client);
@@ -527,8 +526,6 @@ app.get("/api/clients/:client/download", (req, res) => {
   }
 });
 
-// ✅ Upload base64 (supports ?path=...)
-// body: { fileName, base64, contentType? }
 app.post("/api/clients/:client/uploadBase64", (req, res) => {
   try {
     const client = safeName(req.params.client);
@@ -562,7 +559,64 @@ app.post("/api/clients/:client/uploadBase64", (req, res) => {
   }
 });
 
-// ✅ Delete file (supports ?file=...&path=...)
+// ✅ Trash (soft delete) for FILES + FOLDERS
+// POST /api/clients/:client/trash?path=...
+// body: { name }
+app.post("/api/clients/:client/trash", (req, res) => {
+  try {
+    const client = safeName(req.params.client);
+    const rel = normalizeRelPath(req.query.path || "");
+    const name = safeName(req.body?.name);
+
+    if (!name) return res.status(400).json({ ok: false, error: "name required" });
+
+    const clientPath = resolveInside(CLIENTS_DIR, client);
+    const fromDir = rel ? resolveInside(clientPath, rel) : clientPath;
+    const fromFull = resolveInside(fromDir, name);
+
+    if (!fs.existsSync(fromFull)) return res.status(404).json({ ok: false, error: "Not found" });
+
+    // Trash base: 05 Downloads/_Trash
+    const trashBase = resolveInside(clientPath, path.join("05 Downloads", "_Trash"));
+    ensureDir(trashBase);
+
+    // keep subfolders matching original path
+    const trashSub = rel ? resolveInside(trashBase, rel) : trashBase;
+    ensureDir(trashSub);
+
+    // If same name exists in trash, append timestamp
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    let destName = name;
+    let destFull = resolveInside(trashSub, destName);
+
+    if (fs.existsSync(destFull)) {
+      const ext = path.extname(name);
+      const baseName = ext ? path.basename(name, ext) : name;
+      destName = `${baseName}__${stamp}${ext || ""}`;
+      destFull = resolveInside(trashSub, destName);
+    }
+
+    // Try rename first (fast). If it fails, fallback to recursive copy+delete.
+    try {
+      fs.renameSync(fromFull, destFull);
+    } catch {
+      copyRecursiveSync(fromFull, destFull);
+      removeRecursiveSync(fromFull);
+    }
+
+    return res.json({
+      ok: true,
+      moved: name,
+      fromPath: rel,
+      trashedAs: destName,
+      trashPath: rel ? `05 Downloads/_Trash/${rel}` : "05 Downloads/_Trash",
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Hard delete file (still file-only)
 app.delete("/api/clients/:client/file", (req, res) => {
   try {
     const client = safeName(req.params.client);
@@ -587,6 +641,9 @@ app.delete("/api/clients/:client/file", (req, res) => {
 // ----- Start -----
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`HabeshaWeb backend running on :${PORT}`);
+  console.log(
+    `ALLOWED_ORIGINS: ${ALLOWED_ORIGINS.length ? ALLOWED_ORIGINS.join(", ") : "(not set - allowing all)"}`
+  );
   console.log(`AUTH_TOKEN set: ${AUTH_TOKEN ? "YES" : "NO"}`);
   console.log(`JWT_SECRET set: ${JWT_SECRET ? "YES" : "NO"}`);
   console.log(`ADMIN_EMAIL set: ${ADMIN_EMAIL ? "YES" : "NO"}`);
