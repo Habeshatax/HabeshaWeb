@@ -739,6 +739,51 @@ app.delete("/api/clients/:client/trash", (req, res) => {
   }
 });
 
+// ❌ Delete ONE item from Trash permanently (FILES + FOLDERS)
+// DELETE /api/clients/:client/trashItem?path=...&name=...
+app.delete("/api/clients/:client/trashItem", (req, res) => {
+  try {
+    const client = safeName(req.params.client);
+    const rel = normalizeRelPath(req.query.path || ""); // original folder rel path (mirrored under _Trash)
+    const name = safeName(req.query.name || "");
+
+    if (!name) return res.status(400).json({ ok: false, error: "name query required" });
+
+    const clientPath = resolveInside(CLIENTS_DIR, client);
+    ensureDir(clientPath);
+
+    const trashBase = resolveInside(clientPath, path.join("05 Downloads", "_Trash"));
+    ensureDir(trashBase);
+
+    const trashSub = rel ? resolveInside(trashBase, rel) : trashBase;
+    const itemFull = resolveInside(trashSub, name);
+
+    if (!fs.existsSync(itemFull)) return res.status(404).json({ ok: false, error: "Not found in Trash" });
+
+    // hard delete the item
+    removeRecursiveSync(itemFull);
+
+    // cleanup empty folders up to trash root (best effort)
+    try {
+      if (rel) {
+        let cur = trashSub;
+        while (cur.startsWith(trashBase) && cur !== trashBase) {
+          const entries = fs.readdirSync(cur);
+          if (entries.length > 0) break;
+          fs.rmdirSync(cur);
+          cur = path.dirname(cur);
+        }
+      }
+    } catch {
+      // ignore cleanup errors
+    }
+
+    return res.json({ ok: true, deleted: name, path: rel });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // Hard delete file (still file-only)
 app.delete("/api/clients/:client/file", (req, res) => {
   try {
