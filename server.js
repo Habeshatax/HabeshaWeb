@@ -25,12 +25,9 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
 
 const corsOptions = {
   origin: (origin, cb) => {
-    if (!origin) return cb(null, true); // allow curl/Postman/server-to-server
+    if (!origin) return cb(null, true);
 
-    if (ALLOWED_ORIGINS.length === 0) {
-      return cb(null, true); // allow all (testing)
-    }
-
+    if (ALLOWED_ORIGINS.length === 0) return cb(null, true);
     if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
 
     return cb(new Error("CORS blocked for origin: " + origin));
@@ -42,7 +39,7 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
-app.options("*", cors(corsOptions)); // ✅ handle preflight
+app.options("*", cors(corsOptions));
 
 // ----- Config -----
 const PORT = process.env.PORT || 8787;
@@ -50,11 +47,16 @@ const PORT = process.env.PORT || 8787;
 // Optional legacy static token support
 const AUTH_TOKEN = (process.env.AUTH_TOKEN || "").trim();
 
-// Admin credentials for login
+// Admin credentials
 const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || "").trim().toLowerCase();
 const ADMIN_PASSWORD = (process.env.ADMIN_PASSWORD || "").trim();
 
-// JWT secret for issuing/verifying tokens
+// Client credentials (single client for now)
+const CLIENT_EMAIL = (process.env.CLIENT_EMAIL || "").trim().toLowerCase();
+const CLIENT_PASSWORD = (process.env.CLIENT_PASSWORD || "").trim();
+const CLIENT_NAME = (process.env.CLIENT_NAME || "").trim(); // must match folder name under /clients
+
+// JWT secret
 const JWT_SECRET = (process.env.JWT_SECRET || "").trim();
 
 const BASE_DIR =
@@ -100,28 +102,6 @@ function verifyJwtToken(token) {
   }
 }
 
-// Protect only /api routes
-function requireAuth(req, res, next) {
-  if (!AUTH_TOKEN && !JWT_SECRET) return next();
-
-  const token = getBearer(req);
-
-  // 1) Allow old fixed AUTH_TOKEN
-  if (AUTH_TOKEN && token === AUTH_TOKEN) {
-    req.user = { id: "legacy", email: "legacy@token", role: "admin" };
-    return next();
-  }
-
-  // 2) Allow JWT
-  const payload = verifyJwtToken(token);
-  if (payload) {
-    req.user = payload;
-    return next();
-  }
-
-  return res.status(401).json({ ok: false, error: "Unauthorized" });
-}
-
 function normalizeRelPath(p) {
   const raw = String(p || "").trim();
   if (!raw) return "";
@@ -135,185 +115,14 @@ function normalizeRelPath(p) {
   return decoded.replace(/\/{2,}/g, "/");
 }
 
-function getCurrentTaxYearLabel(now = new Date()) {
-  const y = now.getFullYear();
-  const april6 = new Date(y, 3, 6);
-  const startYear = now >= april6 ? y : y - 1;
-  const endYear = startYear + 1;
-  return `${startYear}-${String(endYear).slice(2)}`;
-}
-
-function createTaxYearTree(basePath, label) {
-  const p = path.join(basePath, label);
-  ensureDir(p);
-
-  const sub = [
-    "01 Income",
-    "02 Expenses",
-    "03 Bank Statements",
-    "04 CIS Statements",
-    "05 Pensions & Benefits",
-    "06 Other",
-    "07 Final & Submitted",
-  ];
-  sub.forEach((s) => ensureDir(path.join(p, s)));
-}
-
-function createStandardClientRoot(clientPath) {
-  const roots = [
-    "00 Engagement Letter",
-    "01 Proof of ID",
-    "02 Compliance",
-    "03 Work",
-    "04 Personal",
-    "05 Downloads",
-  ];
-  roots.forEach((r) => ensureDir(path.join(clientPath, r)));
-
-  const idBase = path.join(clientPath, "01 Proof of ID");
-  ["01 Passport - BRP - eVisa", "02 Proof of Address", "03 Signed Engagement Letter"].forEach((s) =>
-    ensureDir(path.join(idBase, s))
-  );
-}
-
-function normalizeBusinessType(businessType) {
-  const t = String(businessType || "").trim().toLowerCase();
-  if (t === "landlord") return "landlords";
-  if (t === "individual") return "self_assessment";
-  if (t === "self assessment") return "self_assessment";
-  if (t === "limited company") return "limited_company";
-  return t || "self_assessment";
-}
-
-function normalizeServices(services) {
-  if (!Array.isArray(services)) return [];
-  return services.map((s) => String(s || "").trim().toLowerCase()).filter(Boolean);
-}
-
-function createComplianceStructure(clientPath, businessType, services) {
-  const complianceBase = path.join(clientPath, "02 Compliance");
-  ensureDir(complianceBase);
-
-  const type = normalizeBusinessType(businessType);
-  const svc = normalizeServices(services);
-
-  ensureDir(path.join(complianceBase, "00 Client Info"));
-
-  if (svc.includes("self_assessment") || type === "self_assessment") {
-    const sa = path.join(complianceBase, "01 Self Assessment");
-    ensureDir(sa);
-
-    const current = getCurrentTaxYearLabel();
-    const startYear = parseInt(current.split("-")[0], 10);
-    const prev = `${startYear - 1}-${String(startYear).slice(2)}`;
-
-    createTaxYearTree(sa, prev);
-    createTaxYearTree(sa, current);
-  }
-
-  if (svc.includes("landlords") || type === "landlords") {
-    const ll = path.join(complianceBase, "02 Landlords");
-    ensureDir(ll);
-
-    const current = getCurrentTaxYearLabel();
-    const startYear = parseInt(current.split("-")[0], 10);
-    const prev = `${startYear - 1}-${String(startYear).slice(2)}`;
-
-    createTaxYearTree(ll, prev);
-    createTaxYearTree(ll, current);
-
-    ["08 Properties", "09 Tenancy Agreements", "10 Mortgage Interest", "11 Letting Agent Statements"].forEach(
-      (s) => ensureDir(path.join(ll, s))
-    );
-  }
-
-  if (svc.includes("limited_company") || type === "limited_company") {
-    const ltd = path.join(complianceBase, "03 Limited Company");
-    ensureDir(ltd);
-
-    [
-      "01 Company Details",
-      "02 Sales (Invoices - POS - Reports)",
-      "03 Purchases & Expenses (Invoices - Receipts)",
-      "04 Banking (Bank Statements - Credit Cards - Cash)",
-      "05 Directors Loan Account",
-      "06 Payroll",
-      "07 VAT (MTD)",
-      "08 CIS",
-      "09 Loans (Agreements - HP - Leases - Interest)",
-      "10 Grants",
-      "11 Previous Year",
-      "12 Accounts & CT600",
-      "13 Final & Submitted",
-    ].forEach((s) => ensureDir(path.join(ltd, s)));
-  }
-
-  if (svc.includes("bookkeeping")) {
-    const bk = path.join(complianceBase, "04 Bookkeeping");
-    ensureDir(bk);
-    ["01 Sales", "02 Purchases", "03 Banking", "04 Reports", "05 Queries"].forEach((s) =>
-      ensureDir(path.join(bk, s))
-    );
-  }
-
-  if (svc.includes("vat_mtd")) {
-    const vat = path.join(complianceBase, "05 VAT (MTD)");
-    ensureDir(vat);
-    ["01 VAT Returns", "02 VAT Working Papers", "03 VAT Receipts", "04 Final & Submitted"].forEach((s) =>
-      ensureDir(path.join(vat, s))
-    );
-  }
-
-  if (svc.includes("payroll")) {
-    const pr = path.join(complianceBase, "06 Payroll");
-    ensureDir(pr);
-    [
-      "01 Employees",
-      "02 Timesheets",
-      "03 Payroll Reports",
-      "04 RTI (FPS - EPS)",
-      "05 P45 - P60",
-      "06 Pension",
-      "07 Final & Submitted",
-    ].forEach((s) => ensureDir(path.join(pr, s)));
-  }
-
-  if (svc.includes("home_office")) {
-    const ho = path.join(complianceBase, "07 Home Office Applications");
-    ensureDir(ho);
-    ["01 Applications", "02 Supporting Docs", "03 Correspondence", "04 Final & Submitted"].forEach((s) =>
-      ensureDir(path.join(ho, s))
-    );
-  }
-}
-
-function createClientFolderTree(clientPath, businessType, services) {
-  createStandardClientRoot(clientPath);
-  createComplianceStructure(clientPath, businessType, services);
-}
-
-function addExtIfMissing(fileName, contentType) {
-  if (!fileName) return fileName;
-  if (path.extname(fileName)) return fileName;
-
-  const ct = String(contentType || "").toLowerCase();
-  if (ct.includes("pdf")) return `${fileName}.pdf`;
-  if (ct.includes("png")) return `${fileName}.png`;
-  if (ct.includes("jpeg") || ct.includes("jpg")) return `${fileName}.jpg`;
-  if (ct.includes("text")) return `${fileName}.txt`;
-  return fileName;
-}
-
-// ✅ Recursive copy (for folder trash fallback)
+// ✅ Recursive copy (folder fallback)
 function copyRecursiveSync(src, dest) {
   const stat = fs.statSync(src);
 
   if (stat.isDirectory()) {
     ensureDir(dest);
     for (const entry of fs.readdirSync(src)) {
-      const from = path.join(src, entry);
-      const to = path.join(dest, entry);
-      copyRecursiveSync(from, to);
+      copyRecursiveSync(path.join(src, entry), path.join(dest, entry));
     }
     return;
   }
@@ -321,7 +130,7 @@ function copyRecursiveSync(src, dest) {
   fs.copyFileSync(src, dest);
 }
 
-// ✅ Recursive delete (for folder trash fallback)
+// ✅ Recursive delete (folder support)
 function removeRecursiveSync(target) {
   if (!fs.existsSync(target)) return;
   const stat = fs.statSync(target);
@@ -335,6 +144,78 @@ function removeRecursiveSync(target) {
   }
 
   fs.unlinkSync(target);
+}
+
+// --------------------------
+// AUTH middleware
+// --------------------------
+
+// Protect only /api routes
+function requireAuth(req, res, next) {
+  if (!AUTH_TOKEN && !JWT_SECRET) return next();
+
+  const token = getBearer(req);
+
+  // Legacy fixed AUTH_TOKEN
+  if (AUTH_TOKEN && token === AUTH_TOKEN) {
+    req.user = { id: "legacy", email: "legacy@token", role: "admin" };
+    return next();
+  }
+
+  const payload = verifyJwtToken(token);
+  if (payload) {
+    req.user = payload;
+    return next();
+  }
+
+  return res.status(401).json({ ok: false, error: "Unauthorized" });
+}
+
+function requireAdmin(req, res, next) {
+  if ((req.user?.role || "") === "admin") return next();
+  return res.status(403).json({ ok: false, error: "Forbidden (admin only)" });
+}
+
+// Client can only access their own :client folder
+function enforceClientMatch(req, res, next) {
+  const role = req.user?.role || "admin";
+  if (role === "admin") return next();
+
+  const routeClient = safeName(req.params.client || "");
+  const tokenClient = safeName(req.user?.client || "");
+  if (!routeClient || !tokenClient) return res.status(403).json({ ok: false, error: "Forbidden" });
+
+  if (routeClient !== tokenClient) {
+    return res.status(403).json({ ok: false, error: "Forbidden (client mismatch)" });
+  }
+  return next();
+}
+
+// Client writes allowed only inside these roots
+const CLIENT_WRITE_ROOTS = ["05 Downloads", "03 Work"];
+
+function isAllowedClientWrite(rel) {
+  const r = normalizeRelPath(rel || "");
+  if (!r) return false; // writing at client root => no
+
+  return CLIENT_WRITE_ROOTS.some((root) => r === root || r.startsWith(root + "/"));
+}
+
+function requireWriteAccess(req, res, next) {
+  const role = req.user?.role || "admin";
+  if (role === "admin") return next();
+
+  // For trash/restore/delete-in-trash, `path` represents original folder rel path mirrored under _Trash
+  // For normal writes, `path` is the normal folder path
+  const rel = normalizeRelPath(req.query.path || "");
+
+  if (!isAllowedClientWrite(rel)) {
+    return res.status(403).json({
+      ok: false,
+      error: `Forbidden (client can only write inside: ${CLIENT_WRITE_ROOTS.join(", ")})`,
+    });
+  }
+  return next();
 }
 
 ensureDir(CLIENTS_DIR);
@@ -356,11 +237,7 @@ app.get("/", (req, res) => {
   res.status(200).send("HabeshaWeb backend is running. Try /health or /api/health");
 });
 
-app.get("/login", (req, res) => {
-  res.status(200).send("Use POST /login with JSON body { email, password }. This is an API endpoint.");
-});
-
-// ----- LOGIN (PUBLIC) -----
+// ----- Admin Login (PUBLIC) -----
 app.post("/login", (req, res) => {
   try {
     const email = String(req.body?.email || "").trim().toLowerCase();
@@ -369,16 +246,44 @@ app.post("/login", (req, res) => {
     if (!ADMIN_EMAIL || !ADMIN_PASSWORD) {
       return res.status(500).json({ ok: false, error: "ADMIN_EMAIL / ADMIN_PASSWORD not set on server" });
     }
-
     if (email !== ADMIN_EMAIL || password !== ADMIN_PASSWORD) {
       return res.status(401).json({ ok: false, error: "Invalid login" });
     }
-
-    if (!JWT_SECRET) {
-      return res.status(500).json({ ok: false, error: "JWT_SECRET not set on server" });
-    }
+    if (!JWT_SECRET) return res.status(500).json({ ok: false, error: "JWT_SECRET not set on server" });
 
     const user = { id: "admin", email: ADMIN_EMAIL, role: "admin" };
+    const token = jwt.sign(user, JWT_SECRET, { expiresIn: "7d" });
+    return res.json({ ok: true, token, user });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ----- Client Login (PUBLIC) -----
+app.post("/client-login", (req, res) => {
+  try {
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const password = String(req.body?.password || "").trim();
+
+    if (!CLIENT_EMAIL || !CLIENT_PASSWORD || !CLIENT_NAME) {
+      return res.status(500).json({
+        ok: false,
+        error: "CLIENT_EMAIL / CLIENT_PASSWORD / CLIENT_NAME not set on server",
+      });
+    }
+
+    if (email !== CLIENT_EMAIL || password !== CLIENT_PASSWORD) {
+      return res.status(401).json({ ok: false, error: "Invalid login" });
+    }
+
+    if (!JWT_SECRET) return res.status(500).json({ ok: false, error: "JWT_SECRET not set on server" });
+
+    // Ensure their folder exists (optional safety)
+    const clientFolder = safeName(CLIENT_NAME);
+    const clientPath = resolveInside(CLIENTS_DIR, clientFolder);
+    ensureDir(clientPath);
+
+    const user = { id: "client", email: CLIENT_EMAIL, role: "client", client: clientFolder };
     const token = jwt.sign(user, JWT_SECRET, { expiresIn: "7d" });
 
     return res.json({ ok: true, token, user });
@@ -392,7 +297,8 @@ app.use("/api", requireAuth);
 
 app.get("/api/me", (req, res) => res.json({ ok: true, user: req.user || null }));
 
-app.get("/api/clients", (req, res) => {
+// Admin-only: list clients
+app.get("/api/clients", requireAdmin, (req, res) => {
   try {
     const items = fs
       .readdirSync(CLIENTS_DIR, { withFileTypes: true })
@@ -406,32 +312,28 @@ app.get("/api/clients", (req, res) => {
   }
 });
 
-app.post("/api/clients", (req, res) => {
+// Admin-only: create client
+app.post("/api/clients", requireAdmin, (req, res) => {
   try {
     const name = safeName(req.body?.name);
     if (!name) return res.status(400).json({ ok: false, error: "Client name required" });
 
-    const businessType = normalizeBusinessType(req.body?.businessType || "self_assessment");
-    const services = normalizeServices(req.body?.services || []);
-
     const clientPath = resolveInside(CLIENTS_DIR, name);
     const existed = fs.existsSync(clientPath);
-
     ensureDir(clientPath);
-    createClientFolderTree(clientPath, businessType, services);
 
-    res.json({ ok: true, client: name, created: !existed, businessType, services });
+    res.json({ ok: true, client: name, created: !existed });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-app.post("/api/clients/:client/mkdir", (req, res) => {
+// Create folder (write)
+app.post("/api/clients/:client/mkdir", enforceClientMatch, requireWriteAccess, (req, res) => {
   try {
     const client = safeName(req.params.client);
     const rel = normalizeRelPath(req.query.path || "");
     const name = safeName(req.body?.name);
-
     if (!name) return res.status(400).json({ ok: false, error: "name required" });
 
     const clientPath = resolveInside(CLIENTS_DIR, client);
@@ -449,13 +351,13 @@ app.post("/api/clients/:client/mkdir", (req, res) => {
   }
 });
 
-app.post("/api/clients/:client/writeText", (req, res) => {
+// Write text (write)
+app.post("/api/clients/:client/writeText", enforceClientMatch, requireWriteAccess, (req, res) => {
   try {
     const client = safeName(req.params.client);
     const rel = normalizeRelPath(req.query.path || "");
     const fileName = safeName(req.body?.fileName);
     const text = String(req.body?.text || "");
-
     if (!fileName) return res.status(400).json({ ok: false, error: "fileName required" });
 
     const clientPath = resolveInside(CLIENTS_DIR, client);
@@ -473,7 +375,8 @@ app.post("/api/clients/:client/writeText", (req, res) => {
   }
 });
 
-app.get("/api/clients/:client/files", (req, res) => {
+// List items (read)
+app.get("/api/clients/:client/files", enforceClientMatch, (req, res) => {
   try {
     const client = safeName(req.params.client);
     const rel = normalizeRelPath(req.query.path || "");
@@ -506,7 +409,8 @@ app.get("/api/clients/:client/files", (req, res) => {
   }
 });
 
-app.get("/api/clients/:client/download", (req, res) => {
+// Download (read)
+app.get("/api/clients/:client/download", enforceClientMatch, (req, res) => {
   try {
     const client = safeName(req.params.client);
     const file = String(req.query.file || "");
@@ -526,7 +430,8 @@ app.get("/api/clients/:client/download", (req, res) => {
   }
 });
 
-app.post("/api/clients/:client/uploadBase64", (req, res) => {
+// Upload base64 (write)
+app.post("/api/clients/:client/uploadBase64", enforceClientMatch, requireWriteAccess, (req, res) => {
   try {
     const client = safeName(req.params.client);
     const rel = normalizeRelPath(req.query.path || "");
@@ -538,7 +443,13 @@ app.post("/api/clients/:client/uploadBase64", (req, res) => {
     if (!fileName) return res.status(400).json({ ok: false, error: "fileName required" });
     if (!base64Input) return res.status(400).json({ ok: false, error: "base64 required" });
 
-    fileName = addExtIfMissing(fileName, contentType);
+    if (!path.extname(fileName)) {
+      const ct = String(contentType || "").toLowerCase();
+      if (ct.includes("pdf")) fileName = `${fileName}.pdf`;
+      else if (ct.includes("png")) fileName = `${fileName}.png`;
+      else if (ct.includes("jpeg") || ct.includes("jpg")) fileName = `${fileName}.jpg`;
+      else if (ct.includes("text")) fileName = `${fileName}.txt`;
+    }
 
     const clientPath = resolveInside(CLIENTS_DIR, client);
     ensureDir(clientPath);
@@ -549,7 +460,6 @@ app.post("/api/clients/:client/uploadBase64", (req, res) => {
     const full = resolveInside(targetDir, fileName);
 
     const cleaned = base64Input.includes("base64,") ? base64Input.split("base64,")[1] : base64Input;
-
     const buf = Buffer.from(cleaned, "base64");
     fs.writeFileSync(full, buf);
 
@@ -559,10 +469,8 @@ app.post("/api/clients/:client/uploadBase64", (req, res) => {
   }
 });
 
-// ✅ Trash (soft delete) for FILES + FOLDERS
-// POST /api/clients/:client/trash?path=...
-// body: { name }
-app.post("/api/clients/:client/trash", (req, res) => {
+// ✅ Trash (soft delete) (write)
+app.post("/api/clients/:client/trash", enforceClientMatch, requireWriteAccess, (req, res) => {
   try {
     const client = safeName(req.params.client);
     const rel = normalizeRelPath(req.query.path || "");
@@ -576,15 +484,12 @@ app.post("/api/clients/:client/trash", (req, res) => {
 
     if (!fs.existsSync(fromFull)) return res.status(404).json({ ok: false, error: "Not found" });
 
-    // Trash base: 05 Downloads/_Trash
     const trashBase = resolveInside(clientPath, path.join("05 Downloads", "_Trash"));
     ensureDir(trashBase);
 
-    // keep subfolders matching original path
     const trashSub = rel ? resolveInside(trashBase, rel) : trashBase;
     ensureDir(trashSub);
 
-    // If same name exists in trash, append timestamp
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
     let destName = name;
     let destFull = resolveInside(trashSub, destName);
@@ -596,7 +501,6 @@ app.post("/api/clients/:client/trash", (req, res) => {
       destFull = resolveInside(trashSub, destName);
     }
 
-    // Try rename first (fast). If it fails, fallback to recursive copy+delete.
     try {
       fs.renameSync(fromFull, destFull);
     } catch {
@@ -616,14 +520,8 @@ app.post("/api/clients/:client/trash", (req, res) => {
   }
 });
 
-/**
- * ♻️ Restore from Trash (FILES + FOLDERS)
- * POST /api/clients/:client/restore?path=...&name=...
- *
- * path = original folder relative path (mirrored under _Trash)
- * name = trashed item name inside the trash folder (may include __timestamp)
- */
-app.post("/api/clients/:client/restore", (req, res) => {
+// ♻️ Restore from Trash (write — restoring back into original folder)
+app.post("/api/clients/:client/restore", enforceClientMatch, requireWriteAccess, (req, res) => {
   try {
     const client = safeName(req.params.client);
     const rel = normalizeRelPath(req.query.path || "");
@@ -647,7 +545,6 @@ app.post("/api/clients/:client/restore", (req, res) => {
     const toDir = rel ? resolveInside(clientPath, rel) : clientPath;
     ensureDir(toDir);
 
-    // If destination exists, rename restored item
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
     let destName = name;
     let destFull = resolveInside(toDir, destName);
@@ -666,7 +563,7 @@ app.post("/api/clients/:client/restore", (req, res) => {
       removeRecursiveSync(trashedFull);
     }
 
-    // Clean up empty trash subfolders (best effort)
+    // cleanup empty folders up to trash root
     try {
       if (rel) {
         let cur = trashSub;
@@ -677,25 +574,16 @@ app.post("/api/clients/:client/restore", (req, res) => {
           cur = path.dirname(cur);
         }
       }
-    } catch {
-      // ignore cleanup errors
-    }
+    } catch {}
 
-    return res.json({
-      ok: true,
-      restored: name,
-      restoredAs: destName,
-      toPath: rel,
-    });
+    return res.json({ ok: true, restored: name, restoredAs: destName, toPath: rel });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// 🧨 Empty Trash (hard delete) - FILES + FOLDERS
-// DELETE /api/clients/:client/trash?path=...
-// If path is empty => empties entire 05 Downloads/_Trash
-app.delete("/api/clients/:client/trash", (req, res) => {
+// 🧨 Empty Trash (write — destructive)
+app.delete("/api/clients/:client/trash", enforceClientMatch, requireWriteAccess, (req, res) => {
   try {
     const client = safeName(req.params.client);
     const rel = normalizeRelPath(req.query.path || "");
@@ -707,18 +595,16 @@ app.delete("/api/clients/:client/trash", (req, res) => {
     ensureDir(trashBase);
 
     const trashTarget = rel ? resolveInside(trashBase, rel) : trashBase;
-
     if (!fs.existsSync(trashTarget)) {
       return res.json({ ok: true, emptied: true, path: rel, note: "Trash folder did not exist" });
     }
 
-    // delete everything inside trashTarget, keep the folder itself
     const entries = fs.readdirSync(trashTarget);
     for (const entry of entries) {
       removeRecursiveSync(path.join(trashTarget, entry));
     }
 
-    // clean up empty parent folders (best effort)
+    // cleanup empty parents (best effort)
     try {
       if (rel) {
         let cur = trashTarget;
@@ -729,9 +615,7 @@ app.delete("/api/clients/:client/trash", (req, res) => {
           cur = path.dirname(cur);
         }
       }
-    } catch {
-      // ignore cleanup errors
-    }
+    } catch {}
 
     return res.json({ ok: true, emptied: true, path: rel });
   } catch (e) {
@@ -739,12 +623,11 @@ app.delete("/api/clients/:client/trash", (req, res) => {
   }
 });
 
-// ❌ Delete ONE item from Trash permanently (FILES + FOLDERS)
-// DELETE /api/clients/:client/trashItem?path=...&name=...
-app.delete("/api/clients/:client/trashItem", (req, res) => {
+// ❌ Delete ONE item from Trash permanently (write — destructive)
+app.delete("/api/clients/:client/trashItem", enforceClientMatch, requireWriteAccess, (req, res) => {
   try {
     const client = safeName(req.params.client);
-    const rel = normalizeRelPath(req.query.path || ""); // original folder rel path (mirrored under _Trash)
+    const rel = normalizeRelPath(req.query.path || "");
     const name = safeName(req.query.name || "");
 
     if (!name) return res.status(400).json({ ok: false, error: "name query required" });
@@ -760,10 +643,9 @@ app.delete("/api/clients/:client/trashItem", (req, res) => {
 
     if (!fs.existsSync(itemFull)) return res.status(404).json({ ok: false, error: "Not found in Trash" });
 
-    // hard delete the item
     removeRecursiveSync(itemFull);
 
-    // cleanup empty folders up to trash root (best effort)
+    // cleanup empty folders up to trash root
     try {
       if (rel) {
         let cur = trashSub;
@@ -774,9 +656,7 @@ app.delete("/api/clients/:client/trashItem", (req, res) => {
           cur = path.dirname(cur);
         }
       }
-    } catch {
-      // ignore cleanup errors
-    }
+    } catch {}
 
     return res.json({ ok: true, deleted: name, path: rel });
   } catch (e) {
@@ -784,8 +664,14 @@ app.delete("/api/clients/:client/trashItem", (req, res) => {
   }
 });
 
-// Hard delete file (still file-only)
-app.delete("/api/clients/:client/file", (req, res) => {
+// Hard delete file (admin only)
+app.delete("/api/clients/:client/file", enforceClientMatch, (req, res, next) => {
+  // client users are not allowed to use hard delete file directly
+  if ((req.user?.role || "") === "client") {
+    return res.status(403).json({ ok: false, error: "Forbidden (use Trash / Delete in Trash)" });
+  }
+  return next();
+}, (req, res) => {
   try {
     const client = safeName(req.params.client);
     const file = String(req.query.file || "");
@@ -815,6 +701,9 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`AUTH_TOKEN set: ${AUTH_TOKEN ? "YES" : "NO"}`);
   console.log(`JWT_SECRET set: ${JWT_SECRET ? "YES" : "NO"}`);
   console.log(`ADMIN_EMAIL set: ${ADMIN_EMAIL ? "YES" : "NO"}`);
+  console.log(`CLIENT_EMAIL set: ${CLIENT_EMAIL ? "YES" : "NO"}`);
+  console.log(`CLIENT_NAME set: ${CLIENT_NAME ? CLIENT_NAME : "(not set)"}`);
   console.log(`BASE_DIR: ${BASE_DIR}`);
   console.log(`CLIENTS_DIR: ${CLIENTS_DIR}`);
+  console.log(`CLIENT_WRITE_ROOTS: ${CLIENT_WRITE_ROOTS.join(", ")}`);
 });
