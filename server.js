@@ -6,7 +6,7 @@ import path from "path";
 import os from "os";
 import cors from "cors";
 import jwt from "jsonwebtoken";
-import bcrypt from "bcrypt";
+import bcrypt from "bcryptjs";
 import { fileURLToPath } from "url";
 
 const app = express();
@@ -26,8 +26,8 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
 
 const corsOptions = {
   origin: (origin, cb) => {
-    if (!origin) return cb(null, true);
-    if (ALLOWED_ORIGINS.length === 0) return cb(null, true);
+    if (!origin) return cb(null, true); // allow curl/Postman/server-to-server
+    if (ALLOWED_ORIGINS.length === 0) return cb(null, true); // allow all (testing)
     if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
     return cb(new Error("CORS blocked for origin: " + origin));
   },
@@ -50,26 +50,27 @@ const AUTH_TOKEN = (process.env.AUTH_TOKEN || "").trim();
 const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || "").trim().toLowerCase();
 const ADMIN_PASSWORD = (process.env.ADMIN_PASSWORD || "").trim();
 
-// (Legacy single client fallback)
+// Legacy single client fallback (optional)
 const CLIENT_EMAIL = (process.env.CLIENT_EMAIL || "").trim().toLowerCase();
 const CLIENT_PASSWORD = (process.env.CLIENT_PASSWORD || "").trim();
 const CLIENT_NAME = (process.env.CLIENT_NAME || "").trim();
 
-// ✅ Optional: multiple client users via JSON (fallback only now)
-// Example:
-// CLIENT_USERS_JSON=[{"email":"a@x.com","password":"123","client":"Client A"},{"email":"b@x.com","password":"456","client":"Client B"}]
+// Optional legacy multi client list (optional)
 const CLIENT_USERS_JSON = (process.env.CLIENT_USERS_JSON || "").trim();
 
 // JWT secret
 const JWT_SECRET = (process.env.JWT_SECRET || "").trim();
 
+// Base directory
 const BASE_DIR =
   process.env.BASE_DIR ||
   (process.env.RENDER ? "/tmp/habesha" : path.join(os.homedir(), "Documents", "Habesha"));
 
 const CLIENTS_DIR = path.join(BASE_DIR, "clients");
 
-// ----- Helpers -----
+// --------------------------
+// Helpers
+// --------------------------
 function ensureDir(p) {
   if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
 }
@@ -119,10 +120,6 @@ function normalizeRelPath(p) {
   return decoded.replace(/\/{2,}/g, "/");
 }
 
-function normalizeEmail(email) {
-  return String(email || "").trim().toLowerCase();
-}
-
 // ✅ Recursive copy (folder fallback)
 function copyRecursiveSync(src, dest) {
   const stat = fs.statSync(src);
@@ -154,234 +151,60 @@ function removeRecursiveSync(target) {
   fs.unlinkSync(target);
 }
 
-// ----------------------------------------------------
-// Client folder tree helpers (your existing structure)
-// ----------------------------------------------------
-function getCurrentTaxYearLabel(now = new Date()) {
-  const y = now.getFullYear();
-  const april6 = new Date(y, 3, 6);
-  const startYear = now >= april6 ? y : y - 1;
-  const endYear = startYear + 1;
-  return `${startYear}-${String(endYear).slice(2)}`;
-}
+// --------------------------
+// Persistent client user store (on disk)
+// --------------------------
+const USERS_DIR = path.join(BASE_DIR, "_users");
+const CLIENT_USERS_FILE = path.join(USERS_DIR, "clients.json");
 
-function createTaxYearTree(basePath, label) {
-  const p = path.join(basePath, label);
-  ensureDir(p);
-
-  const sub = [
-    "01 Income",
-    "02 Expenses",
-    "03 Bank Statements",
-    "04 CIS Statements",
-    "05 Pensions & Benefits",
-    "06 Other",
-    "07 Final & Submitted",
-  ];
-  sub.forEach((s) => ensureDir(path.join(p, s)));
-}
-
-function createStandardClientRoot(clientPath) {
-  const roots = [
-    "00 Engagement Letter",
-    "01 Proof of ID",
-    "02 Compliance",
-    "03 Work",
-    "04 Personal",
-    "05 Downloads",
-  ];
-  roots.forEach((r) => ensureDir(path.join(clientPath, r)));
-
-  const idBase = path.join(clientPath, "01 Proof of ID");
-  ["01 Passport - BRP - eVisa", "02 Proof of Address", "03 Signed Engagement Letter"].forEach((s) =>
-    ensureDir(path.join(idBase, s))
-  );
-}
-
-function normalizeBusinessType(businessType) {
-  const t = String(businessType || "").trim().toLowerCase();
-  if (t === "landlord") return "landlords";
-  if (t === "individual") return "self_assessment";
-  if (t === "self assessment") return "self_assessment";
-  if (t === "limited company") return "limited_company";
-  if (t === "ltd") return "limited_company";
-  return t || "self_assessment";
-}
-
-function normalizeServices(services) {
-  if (!Array.isArray(services)) return [];
-  return services.map((s) => String(s || "").trim().toLowerCase()).filter(Boolean);
-}
-
-function createComplianceStructure(clientPath, businessType, services) {
-  const complianceBase = path.join(clientPath, "02 Compliance");
-  ensureDir(complianceBase);
-
-  const type = normalizeBusinessType(businessType);
-  const svc = normalizeServices(services);
-
-  ensureDir(path.join(complianceBase, "00 Client Info"));
-
-  if (svc.includes("self_assessment") || type === "self_assessment") {
-    const sa = path.join(complianceBase, "01 Self Assessment");
-    ensureDir(sa);
-
-    const current = getCurrentTaxYearLabel();
-    const startYear = parseInt(current.split("-")[0], 10);
-    const prev = `${startYear - 1}-${String(startYear).slice(2)}`;
-
-    createTaxYearTree(sa, prev);
-    createTaxYearTree(sa, current);
-  }
-
-  if (svc.includes("landlords") || type === "landlords") {
-    const ll = path.join(complianceBase, "02 Landlords");
-    ensureDir(ll);
-
-    const current = getCurrentTaxYearLabel();
-    const startYear = parseInt(current.split("-")[0], 10);
-    const prev = `${startYear - 1}-${String(startYear).slice(2)}`;
-
-    createTaxYearTree(ll, prev);
-    createTaxYearTree(ll, current);
-
-    ["08 Properties", "09 Tenancy Agreements", "10 Mortgage Interest", "11 Letting Agent Statements"].forEach(
-      (s) => ensureDir(path.join(ll, s))
-    );
-  }
-
-  if (svc.includes("limited_company") || type === "limited_company") {
-    const ltd = path.join(complianceBase, "03 Limited Company");
-    ensureDir(ltd);
-
-    [
-      "01 Company Details",
-      "02 Sales (Invoices - POS - Reports)",
-      "03 Purchases & Expenses (Invoices - Receipts)",
-      "04 Banking (Bank Statements - Credit Cards - Cash)",
-      "05 Directors Loan Account",
-      "06 Payroll",
-      "07 VAT (MTD)",
-      "08 CIS",
-      "09 Loans (Agreements - HP - Leases - Interest)",
-      "10 Grants",
-      "11 Previous Year",
-      "12 Accounts & CT600",
-      "13 Final & Submitted",
-    ].forEach((s) => ensureDir(path.join(ltd, s)));
-  }
-
-  if (svc.includes("bookkeeping")) {
-    const bk = path.join(complianceBase, "04 Bookkeeping");
-    ensureDir(bk);
-    ["01 Sales", "02 Purchases", "03 Banking", "04 Reports", "05 Queries"].forEach((s) =>
-      ensureDir(path.join(bk, s))
-    );
-  }
-
-  if (svc.includes("vat_mtd")) {
-    const vat = path.join(complianceBase, "05 VAT (MTD)");
-    ensureDir(vat);
-    ["01 VAT Returns", "02 VAT Working Papers", "03 VAT Receipts", "04 Final & Submitted"].forEach((s) =>
-      ensureDir(path.join(vat, s))
-    );
-  }
-
-  if (svc.includes("payroll")) {
-    const pr = path.join(complianceBase, "06 Payroll");
-    ensureDir(pr);
-    [
-      "01 Employees",
-      "02 Timesheets",
-      "03 Payroll Reports",
-      "04 RTI (FPS - EPS)",
-      "05 P45 - P60",
-      "06 Pension",
-      "07 Final & Submitted",
-    ].forEach((s) => ensureDir(path.join(pr, s)));
-  }
-
-  if (svc.includes("home_office")) {
-    const ho = path.join(complianceBase, "07 Home Office Applications");
-    ensureDir(ho);
-    ["01 Applications", "02 Supporting Docs", "03 Correspondence", "04 Final & Submitted"].forEach((s) =>
-      ensureDir(path.join(ho, s))
-    );
+function ensureUsersStore() {
+  ensureDir(USERS_DIR);
+  if (!fs.existsSync(CLIENT_USERS_FILE)) {
+    fs.writeFileSync(CLIENT_USERS_FILE, JSON.stringify([], null, 2), "utf8");
   }
 }
 
-function createClientFolderTree(clientPath, businessType, services) {
-  createStandardClientRoot(clientPath);
-  createComplianceStructure(clientPath, businessType, services);
-}
-
-// ----------------------------------------------------
-// Client Users DB (file-based)  ✅ A–D
-// ----------------------------------------------------
-const CLIENT_USERS_DB = path.join(BASE_DIR, "_client_users.json");
-
-function readClientUsersDb() {
+function readClientUsersFromDisk() {
+  ensureUsersStore();
   try {
-    if (!fs.existsSync(CLIENT_USERS_DB)) return [];
-    const raw = fs.readFileSync(CLIENT_USERS_DB, "utf8");
-    const data = raw ? JSON.parse(raw) : [];
-    return Array.isArray(data) ? data : [];
+    const raw = fs.readFileSync(CLIENT_USERS_FILE, "utf8");
+    const arr = JSON.parse(raw || "[]");
+    return Array.isArray(arr) ? arr : [];
   } catch {
     return [];
   }
 }
 
-function writeClientUsersDb(users) {
-  ensureDir(BASE_DIR);
-  fs.writeFileSync(CLIENT_USERS_DB, JSON.stringify(users, null, 2), "utf8");
+function writeClientUsersToDisk(users) {
+  ensureUsersStore();
+  fs.writeFileSync(CLIENT_USERS_FILE, JSON.stringify(users, null, 2), "utf8");
 }
 
-function findUserByEmail(users, email) {
-  const em = normalizeEmail(email);
-  return users.find((u) => normalizeEmail(u.email) === em) || null;
-}
-
-function buildClientFolderName({ businessType, firstName, lastName, companyName, displayName }) {
-  const type = normalizeBusinessType(businessType);
-
-  if (displayName && String(displayName).trim()) {
-    return safeName(displayName);
-  }
-
-  if (type === "limited_company") {
-    const nm = String(companyName || "").trim();
-    if (!nm) throw new Error("companyName required for limited_company");
-    return safeName(nm);
-  }
-
-  const fn = String(firstName || "").trim();
-  const ln = String(lastName || "").trim();
-  if (!fn || !ln) throw new Error("firstName and lastName required");
-  return safeName(`${fn} ${ln}`);
-}
-
-// ----------------------------------------------------
-// Build client user list from env (legacy fallback)
-// ----------------------------------------------------
+// --------------------------
+// Optional legacy client user list from ENV (read-only fallback)
+// --------------------------
 function parseClientUsersFromEnv() {
   const users = [];
 
+  // JSON list
   if (CLIENT_USERS_JSON) {
     try {
       const parsed = JSON.parse(CLIENT_USERS_JSON);
-      if (!Array.isArray(parsed)) throw new Error("CLIENT_USERS_JSON must be a JSON array");
-      for (const u of parsed) {
-        const email = normalizeEmail(u?.email);
-        const password = String(u?.password || "").trim();
-        const client = String(u?.client || "").trim();
-        if (!email || !password || !client) continue;
-        users.push({ email, password, client: safeName(client) });
+      if (Array.isArray(parsed)) {
+        for (const u of parsed) {
+          const email = String(u?.email || "").trim().toLowerCase();
+          const password = String(u?.password || "").trim();
+          const client = String(u?.client || "").trim();
+          if (!email || !password || !client) continue;
+          users.push({ email, password, client: safeName(client) });
+        }
       }
     } catch (e) {
       console.error("❌ Failed to parse CLIENT_USERS_JSON:", e.message);
     }
   }
 
+  // single legacy client
   if (CLIENT_EMAIL && CLIENT_PASSWORD && CLIENT_NAME) {
     users.push({
       email: CLIENT_EMAIL,
@@ -390,21 +213,43 @@ function parseClientUsersFromEnv() {
     });
   }
 
+  // de-duplicate by email
   const map = new Map();
   for (const u of users) map.set(u.email, u);
   return Array.from(map.values());
 }
 
-const CLIENT_USERS_FALLBACK = parseClientUsersFromEnv();
+const CLIENT_USERS_ENV = parseClientUsersFromEnv();
 
-// ----------------------------------------------------
+// --------------------------
+// Build client folder name from registration
+// --------------------------
+function buildClientFolderName({ businessType, firstName, lastName, companyName }) {
+  const bt = String(businessType || "").trim();
+
+  if (bt === "limited_company") {
+    const cn = safeName(companyName);
+    if (!cn) throw new Error("Company name is required for limited companies");
+    return cn;
+  }
+
+  const fn = safeName(firstName);
+  const ln = safeName(lastName);
+  if (!fn || !ln) throw new Error("First name and last name are required");
+  return safeName(`${fn} ${ln}`);
+}
+
+// --------------------------
 // AUTH middleware
-// ----------------------------------------------------
+// --------------------------
+
+// Protect only /api routes
 function requireAuth(req, res, next) {
   if (!AUTH_TOKEN && !JWT_SECRET) return next();
 
   const token = getBearer(req);
 
+  // Legacy fixed AUTH_TOKEN
   if (AUTH_TOKEN && token === AUTH_TOKEN) {
     req.user = { id: "legacy", email: "legacy@token", role: "admin" };
     return next();
@@ -462,31 +307,36 @@ function requireWriteAccess(req, res, next) {
   return next();
 }
 
+// Boot folders/stores
 ensureDir(CLIENTS_DIR);
+ensureUsersStore();
 
 // ----- Health -----
 app.get("/health", (req, res) => res.status(200).send("ok"));
 
-app.get("/api/health", (req, res) =>
+app.get("/api/health", (req, res) => {
+  const diskUsers = readClientUsersFromDisk();
   res.status(200).json({
     ok: true,
     service: "habeshaweb",
     baseDir: BASE_DIR,
     clientsDir: CLIENTS_DIR,
-    clientUsersConfiguredInDb: readClientUsersDb().length,
-    clientUsersFallback: CLIENT_USERS_FALLBACK.map((u) => ({ email: u.email, client: u.client })),
-  })
-);
+    usersFile: CLIENT_USERS_FILE,
+    diskClientUsers: diskUsers.map((u) => ({ email: u.email, client: u.client })),
+    envClientUsers: CLIENT_USERS_ENV.map((u) => ({ email: u.email, client: u.client })),
+  });
+});
 
 // ----- Home -----
 app.get("/", (req, res) => {
-  res.status(200).send("HabeshaWeb backend is running. Try /health or /api hookupg( health");
+  res.status(200).send("HabeshaWeb backend is running. Try /health or /api/health");
 });
 
 // ----- Admin Login (PUBLIC) -----
+// POST /login { email, password }
 app.post("/login", (req, res) => {
   try {
-    const email = normalizeEmail(req.body?.email);
+    const email = String(req.body?.email || "").trim().toLowerCase();
     const password = String(req.body?.password || "").trim();
 
     if (!ADMIN_EMAIL || !ADMIN_PASSWORD) {
@@ -505,117 +355,126 @@ app.post("/login", (req, res) => {
   }
 });
 
-// ----------------------------------------------------
-// ✅ C) CLIENT REGISTER (PUBLIC)
-// POST /register-client
+// ----- Client Register (PUBLIC) -----
+// POST /client-register
 // body: {
-//   businessType: "self_assessment" | "landlords" | "limited_company",
-//   firstName, lastName, companyName, displayName,
+//   businessType, firstName, lastName, companyName,
 //   email, password,
-//   services: [] (optional)
+//   services: ["bookkeeping","vat_mtd",...]
 // }
-// ----------------------------------------------------
-app.post("/register-client", async (req, res) => {
+app.post("/client-register", async (req, res) => {
   try {
-    const email = normalizeEmail(req.body?.email);
-    const password = String(req.body?.password || "").trim();
-
-    if (!email) return res.status(400).json({ ok: false, error: "email required" });
-    if (!password || password.length < 8) {
-      return res.status(400).json({ ok: false, error: "password required (min 8 chars)" });
-    }
     if (!JWT_SECRET) {
       return res.status(500).json({ ok: false, error: "JWT_SECRET not set on server" });
     }
 
-    const businessType = req.body?.businessType || "self_assessment";
+    const businessType = String(req.body?.businessType || "").trim();
+    const firstName = String(req.body?.firstName || "").trim();
+    const lastName = String(req.body?.lastName || "").trim();
+    const companyName = String(req.body?.companyName || "").trim();
 
-    const folderName = buildClientFolderName({
-      businessType,
-      firstName: req.body?.firstName,
-      lastName: req.body?.lastName,
-      companyName: req.body?.companyName,
-      displayName: req.body?.displayName,
-    });
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const password = String(req.body?.password || "").trim();
 
-    // Load DB + check
-    const users = readClientUsersDb();
-    if (findUserByEmail(users, email)) {
-      return res.status(409).json({ ok: false, error: "Email already registered" });
-    }
+    const services = Array.isArray(req.body?.services)
+      ? req.body.services.map((s) => String(s || "").trim()).filter(Boolean)
+      : [];
 
-    // Create client folder + tree
-    const clientPath = resolveInside(CLIENTS_DIR, folderName);
+    if (!email) return res.status(400).json({ ok: false, error: "Email is required" });
+    if (password.length < 8) return res.status(400).json({ ok: false, error: "Password must be at least 8 characters" });
+
+    // Create client folder name (company or first+last)
+    const clientFolder = buildClientFolderName({ businessType, firstName, lastName, companyName });
+
+    // Ensure client folder exists
+    const clientPath = resolveInside(CLIENTS_DIR, clientFolder);
     ensureDir(clientPath);
 
-    const services = Array.isArray(req.body?.services) ? req.body.services : [];
-    createClientFolderTree(clientPath, businessType, services);
+    // Read users from disk
+    const users = readClientUsersFromDisk();
 
-    // Store hashed password
+    // Prevent duplicate email (disk)
+    const existsDisk = users.find((u) => String(u?.email || "").toLowerCase() === email);
+    if (existsDisk) {
+      return res.status(409).json({ ok: false, error: "This email is already registered" });
+    }
+
+    // Also prevent clash with env fallback users (optional)
+    const existsEnv = CLIENT_USERS_ENV.find((u) => u.email === email);
+    if (existsEnv) {
+      return res.status(409).json({ ok: false, error: "This email is already registered (server env user)" });
+    }
+
+    // Hash password
     const passwordHash = await bcrypt.hash(password, 10);
 
-    users.push({
+    // Save user to disk
+    const newUser = {
       email,
       passwordHash,
-      client: folderName,
-      businessType: normalizeBusinessType(businessType),
+      client: clientFolder,
+      businessType: businessType || "",
+      services,
       createdAt: new Date().toISOString(),
-      status: "active",
+    };
+
+    users.push(newUser);
+    writeClientUsersToDisk(users);
+
+    // Issue JWT token and log in immediately
+    const userForToken = { id: "client", email, role: "client", client: clientFolder };
+    const token = jwt.sign(userForToken, JWT_SECRET, { expiresIn: "7d" });
+
+    return res.json({
+      ok: true,
+      token,
+      user: userForToken,
+      createdClientFolder: clientFolder,
     });
-
-    writeClientUsersDb(users);
-
-    // Auto-issue token
-    const user = { id: "client", email, role: "client", client: folderName };
-    const token = jwt.sign(user, JWT_SECRET, { expiresIn: "7d" });
-
-    return res.json({ ok: true, client: folderName, token, user });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// ----------------------------------------------------
-// ✅ D) CLIENT LOGIN (PUBLIC)  (DB-first, env fallback)
+// ----- Client Login (PUBLIC) -----
 // POST /client-login { email, password }
-// ----------------------------------------------------
 app.post("/client-login", async (req, res) => {
   try {
-    const email = normalizeEmail(req.body?.email);
+    const email = String(req.body?.email || "").trim().toLowerCase();
     const password = String(req.body?.password || "").trim();
 
-    if (!email || !password) return res.status(400).json({ ok: false, error: "email and password required" });
     if (!JWT_SECRET) return res.status(500).json({ ok: false, error: "JWT_SECRET not set on server" });
 
-    // 1) DB users first (registered clients)
-    const dbUsers = readClientUsersDb();
-    const u = findUserByEmail(dbUsers, email);
+    // 1) Try disk users first (recommended)
+    const diskUsers = readClientUsersFromDisk();
+    const diskMatch = diskUsers.find((u) => String(u?.email || "").toLowerCase() === email);
 
-    if (u && u.status === "active") {
-      const ok = await bcrypt.compare(password, u.passwordHash);
+    if (diskMatch) {
+      const ok = await bcrypt.compare(password, String(diskMatch.passwordHash || ""));
       if (!ok) return res.status(401).json({ ok: false, error: "Invalid login" });
 
-      const clientFolder = safeName(u.client);
+      const clientFolder = safeName(diskMatch.client);
       const clientPath = resolveInside(CLIENTS_DIR, clientFolder);
       ensureDir(clientPath);
 
-      const user = { id: "client", email: u.email, role: "client", client: clientFolder };
+      const user = { id: "client", email: diskMatch.email, role: "client", client: clientFolder };
       const token = jwt.sign(user, JWT_SECRET, { expiresIn: "7d" });
 
       return res.json({ ok: true, token, user });
     }
 
-    // 2) fallback env users (optional)
-    if (CLIENT_USERS_FALLBACK.length) {
-      const match = CLIENT_USERS_FALLBACK.find((x) => x.email === email && x.password === password);
-      if (!match) return res.status(401).json({ ok: false, error: "Invalid login" });
+    // 2) Optional fallback: ENV users (plaintext passwords)
+    if (CLIENT_USERS_ENV.length) {
+      const envMatch = CLIENT_USERS_ENV.find((u) => u.email === email && u.password === password);
+      if (!envMatch) return res.status(401).json({ ok: false, error: "Invalid login" });
 
-      const clientFolder = safeName(match.client);
+      const clientFolder = safeName(envMatch.client);
       const clientPath = resolveInside(CLIENTS_DIR, clientFolder);
       ensureDir(clientPath);
 
-      const user = { id: "client", email: match.email, role: "client", client: clientFolder };
+      const user = { id: "client", email: envMatch.email, role: "client", client: clientFolder };
       const token = jwt.sign(user, JWT_SECRET, { expiresIn: "7d" });
+
       return res.json({ ok: true, token, user });
     }
 
@@ -645,7 +504,7 @@ app.get("/api/clients", requireAdmin, (req, res) => {
   }
 });
 
-// Admin-only: create client
+// Admin-only: create client (folder only)
 app.post("/api/clients", requireAdmin, (req, res) => {
   try {
     const name = safeName(req.body?.name);
@@ -993,14 +852,15 @@ app.delete(
 // ----- Start -----
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`HabeshaWeb backend running on :${PORT}`);
-  console.log(
-    `ALLOWED_ORIGINS: ${ALLOWED_ORIGINS.length ? ALLOWED_ORIGINS.join(", ") : "(not set - allowing all)"}`
-  );
+  console.log(`ALLOWED_ORIGINS: ${ALLOWED_ORIGINS.length ? ALLOWED_ORIGINS.join(", ") : "(not set - allowing all)"}`);
   console.log(`AUTH_TOKEN set: ${AUTH_TOKEN ? "YES" : "NO"}`);
   console.log(`JWT_SECRET set: ${JWT_SECRET ? "YES" : "NO"}`);
   console.log(`ADMIN_EMAIL set: ${ADMIN_EMAIL ? "YES" : "NO"}`);
   console.log(`BASE_DIR: ${BASE_DIR}`);
   console.log(`CLIENTS_DIR: ${CLIENTS_DIR}`);
+  console.log(`USERS_DIR: ${USERS_DIR}`);
+  console.log(`CLIENT_USERS_FILE: ${CLIENT_USERS_FILE}`);
   console.log(`CLIENT_WRITE_ROOTS: ${CLIENT_WRITE_ROOTS.join(", ")}`);
-  console.log(`CLIENT_USERS_DB: ${CLIENT_USERS_DB}`);
+  console.log(`ENV client users configured: ${CLIENT_USERS_ENV.length}`);
+  console.log(`Disk client users currently: ${readClientUsersFromDisk().length}`);
 });
