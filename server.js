@@ -193,13 +193,6 @@ function clientRoot(clientName) {
 // =========================
 // EMAIL (Outlook / Microsoft 365)
 // =========================
-// Env vars:
-// SMTP_HOST=smtp.office365.com
-// SMTP_PORT=587
-// SMTP_USER=info@habeshatax.co.uk
-// SMTP_PASS=***
-// SMTP_FROM=info@habeshatax.co.uk (optional)
-// ADMIN_NOTIFY_EMAIL=info@habeshatax.co.uk (optional)
 function makeMailer() {
   const host = process.env.SMTP_HOST;
   const port = Number(process.env.SMTP_PORT || "587");
@@ -350,8 +343,10 @@ app.post("/login", (req, res) => {
   const email = String(req.body?.email || "").trim().toLowerCase();
   const password = String(req.body?.password || "").trim();
 
-  if (!email || !password) return res.status(400).json({ ok: false, error: "Email and password required" });
-  if (!ADMIN_EMAIL || !ADMIN_PASSWORD) return res.status(500).json({ ok: false, error: "Admin credentials not configured" });
+  if (!email || !password)
+    return res.status(400).json({ ok: false, error: "Email and password required" });
+  if (!ADMIN_EMAIL || !ADMIN_PASSWORD)
+    return res.status(500).json({ ok: false, error: "Admin credentials not configured" });
 
   if (email !== ADMIN_EMAIL || password !== ADMIN_PASSWORD) {
     audit(req, "admin_login_failed", { actor: `admin:${email}`, extra: { ok: false } });
@@ -371,14 +366,19 @@ app.post("/client-login", (req, res) => {
   const email = String(req.body?.email || "").trim().toLowerCase();
   const password = String(req.body?.password || "").trim();
 
-  if (!email || !password) return res.status(400).json({ ok: false, error: "Email and password required" });
+  if (!email || !password)
+    return res.status(400).json({ ok: false, error: "Email and password required" });
 
   const users = loadClientUsers();
   const u = users.find((x) => x.email === email);
   if (!u) return res.status(401).json({ ok: false, error: "Invalid credentials" });
 
   if (!verifyPassword(password, u.passwordHash)) {
-    audit(req, "client_login_failed", { actor: `client:${email}`, client: u.client, extra: { ok: false } });
+    audit(req, "client_login_failed", {
+      actor: `client:${email}`,
+      client: u.client,
+      extra: { ok: false },
+    });
     return res.status(401).json({ ok: false, error: "Invalid credentials" });
   }
 
@@ -402,7 +402,8 @@ app.post("/client-register", async (req, res) => {
     const services = Array.isArray(req.body?.services) ? req.body.services.map((s) => String(s)) : [];
 
     if (!email) return res.status(400).json({ ok: false, error: "Email is required" });
-    if (!password || password.length < 8) return res.status(400).json({ ok: false, error: "Password must be at least 8 characters" });
+    if (!password || password.length < 8)
+      return res.status(400).json({ ok: false, error: "Password must be at least 8 characters" });
 
     if (!["self_assessment", "landlords", "limited_company"].includes(businessType)) {
       return res.status(400).json({ ok: false, error: "Invalid businessType" });
@@ -411,7 +412,8 @@ app.post("/client-register", async (req, res) => {
     if (businessType === "limited_company") {
       if (!companyName) return res.status(400).json({ ok: false, error: "Company name is required" });
     } else {
-      if (!firstName || !lastName) return res.status(400).json({ ok: false, error: "First and last name are required" });
+      if (!firstName || !lastName)
+        return res.status(400).json({ ok: false, error: "First and last name are required" });
     }
 
     ensureDir(CLIENTS_DIR);
@@ -480,17 +482,29 @@ app.post("/client-register", async (req, res) => {
   }
 });
 
-// Password reset (PUBLIC): request link
-app.post("/password-reset/request", async (req, mockingRes) => {
+// =====================================================
+// PASSWORD RESET (PUBLIC)
+// ✅ These are the endpoints your frontend + curl expect:
+//   POST /api/forgot-password
+//   POST /api/reset-password
+// =====================================================
+
+// Request reset link (PUBLIC)
+app.post("/api/forgot-password", async (req, res) => {
   try {
     const email = String(req.body?.email || "").trim().toLowerCase();
-    if (!email) return mockingRes.status(400).json({ ok: false, error: "Email is required" });
+    if (!email) return res.status(400).json({ ok: false, error: "Email is required" });
 
     const users = loadClientUsers();
     const u = users.find((x) => x.email === email);
 
-    // Always return OK to prevent email enumeration
-    if (!u) return mockingRes.json({ ok: true });
+    // Always respond OK (avoid email enumeration)
+    if (!u) {
+      return res.json({
+        ok: true,
+        message: "If that email exists, a reset link has been sent.",
+      });
+    }
 
     const token = createResetToken();
     const expiresAt = Date.now() + 30 * 60 * 1000; // 30 minutes
@@ -516,23 +530,29 @@ app.post("/password-reset/request", async (req, mockingRes) => {
       extra: { hasMailer: !!makeMailer() },
     });
 
-    // In dev, return token if email not configured
+    // In dev only: return token if mail not configured
     const includeToken = process.env.NODE_ENV !== "production" && !makeMailer();
-    mockingRes.json({ ok: true, ...(includeToken ? { token } : {}) });
+
+    res.json({
+      ok: true,
+      message: "If that email exists, a reset link has been sent.",
+      ...(includeToken ? { token } : {}),
+    });
   } catch (e) {
-    mockingRes.status(500).json({ ok: false, error: e.message });
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// Password reset (PUBLIC): confirm
-app.post("/password-reset/confirm", (req, res) => {
+// Confirm reset (PUBLIC)
+app.post("/api/reset-password", (req, res) => {
   try {
     const email = String(req.body?.email || "").trim().toLowerCase();
     const token = String(req.body?.token || "").trim();
     const newPassword = String(req.body?.newPassword || "").trim();
 
     if (!email || !token) return res.status(400).json({ ok: false, error: "Email and token are required" });
-    if (!newPassword || newPassword.length < 8) return res.status(400).json({ ok: false, error: "Password must be at least 8 characters" });
+    if (!newPassword || newPassword.length < 8)
+      return res.status(400).json({ ok: false, error: "Password must be at least 8 characters" });
 
     const tokens = loadResetTokens();
     const match = tokens.find((t) => t.email === email && t.token === token);
@@ -557,10 +577,20 @@ app.post("/password-reset/confirm", (req, res) => {
       extra: { ok: true },
     });
 
-    res.json({ ok: true });
+    res.json({ ok: true, message: "Password updated successfully" });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
+});
+
+// (Optional) backward-compatible aliases (safe to keep)
+app.post("/password-reset/request", (req, res) => {
+  // Just forward to the new route handler by calling it directly
+  // (simple way: respond with 301 message to use /api routes)
+  res.status(301).json({ ok: false, error: "Use POST /api/forgot-password instead" });
+});
+app.post("/password-reset/confirm", (req, res) => {
+  res.status(301).json({ ok: false, error: "Use POST /api/reset-password instead" });
 });
 
 // Current user (PROTECTED)
