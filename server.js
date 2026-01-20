@@ -34,13 +34,44 @@ const ADMIN_NOTIFY_EMAIL = String(process.env.ADMIN_NOTIFY_EMAIL || ADMIN_EMAIL 
   .trim()
   .toLowerCase();
 
+const FRONTEND_URL = String(process.env.FRONTEND_URL || "").trim(); // for password reset link
+
 const BASE_DIR = process.env.BASE_DIR || "/var/data/habesha";
 const CLIENTS_DIR = process.env.CLIENTS_DIR || path.join(BASE_DIR, "clients");
 const USERS_DIR = process.env.USERS_DIR || path.join(BASE_DIR, "_users");
+
 const CLIENT_USERS_FILE =
   process.env.CLIENT_USERS_FILE || path.join(USERS_DIR, "clients.json");
 
-// CORS allowed origins (comma separated) + allow localhost any port
+const RESET_TOKENS_FILE =
+  process.env.RESET_TOKENS_FILE || path.join(USERS_DIR, "resetTokens.json");
+
+// =========================
+// AUDIT LOG
+// =========================
+const AUDIT_DIR = process.env.AUDIT_DIR || path.join(BASE_DIR, "_audit");
+const AUDIT_FILE = process.env.AUDIT_FILE || path.join(AUDIT_DIR, "audit.log");
+
+function audit(req, event, details = {}) {
+  try {
+    ensureDir(AUDIT_DIR);
+    const entry = {
+      ts: new Date().toISOString(),
+      event,
+      ip: req.ip || "",
+      actor: details.actor || "",
+      client: details.client || "",
+      extra: details.extra || {},
+    };
+    fs.appendFileSync(AUDIT_FILE, JSON.stringify(entry) + "\n", "utf8");
+  } catch (e) {
+    console.warn("audit write failed:", e.message);
+  }
+}
+
+// =========================
+// CORS
+// =========================
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
   .map((s) => s.trim())
@@ -122,6 +153,7 @@ function verifyPassword(password, stored) {
 }
 
 function signToken(user) {
+  if (!JWT_SECRET) throw new Error("JWT_SECRET missing");
   return jwt.sign(
     { role: user.role, email: user.email, client: user.client || "" },
     JWT_SECRET,
@@ -161,33 +193,28 @@ function clientRoot(clientName) {
 // =========================
 // EMAIL (Outlook / Microsoft 365)
 // =========================
-// Render env vars you should set:
+// Env vars:
 // SMTP_HOST=smtp.office365.com
 // SMTP_PORT=587
 // SMTP_USER=info@habeshatax.co.uk
-// SMTP_PASS=*** (app password / smtp enabled password)
-// SMTP_FROM=info@habeshatax.co.uk  (optional)
-// SMTP_FROM_NAME=Habesha Tax & Support (optional)
-// ADMIN_NOTIFY_EMAIL=info@habeshatax.co.uk
+// SMTP_PASS=***
+// SMTP_FROM=info@habeshatax.co.uk (optional)
+// ADMIN_NOTIFY_EMAIL=info@habeshatax.co.uk (optional)
 function makeMailer() {
   const host = process.env.SMTP_HOST;
   const port = Number(process.env.SMTP_PORT || "587");
   const user = process.env.SMTP_USER;
   const pass = process.env.SMTP_PASS;
+  const from = process.env.SMTP_FROM || user;
 
-  const fromEmail = (process.env.SMTP_FROM || user || "").trim();
-  const fromName = (process.env.SMTP_FROM_NAME || "").trim();
-
-  if (!host || !user || !pass || !fromEmail) return null;
+  if (!host || !user || !pass || !from) return null;
 
   const transporter = nodemailer.createTransport({
     host,
     port,
-    secure: false, // STARTTLS on 587
+    secure: false,
     auth: { user, pass },
   });
-
-  const from = fromName ? `"${fromName}" <${fromEmail}>` : fromEmail;
 
   return { transporter, from };
 }
@@ -225,30 +252,27 @@ async function sendAdminNewClientEmail(payload, createdClientFolder) {
   });
 }
 
-async function sendPasswordResetCodeEmail({ toEmail, code }) {
+async function sendPasswordResetEmail(toEmail, resetLink) {
   const mailer = makeMailer();
-  if (!mailer) return;
+  if (!mailer) return false;
 
   const { transporter, from } = mailer;
-
-  const subject = "Your password reset code (Habesha Tax & Support)";
-  const lines = [
-    "You requested a password reset for HabeshaWeb.",
-    "",
-    `Your reset code is: ${code}`,
-    "",
-    "This code expires in 15 minutes.",
-    "If you didn’t request this, you can ignore this email.",
-    "",
-    `Time (UTC): ${new Date().toISOString()}`,
-  ];
 
   await transporter.sendMail({
     from,
     to: toEmail,
-    subject,
-    text: lines.join("\n"),
+    subject: "Password reset - HabeshaWeb",
+    text: [
+      "You requested a password reset.",
+      "",
+      "Open this link to reset your password:",
+      resetLink,
+      "",
+      "If you did not request this, ignore this email.",
+    ].join("\n"),
   });
+
+  return true;
 }
 
 // =========================
@@ -291,20 +315,16 @@ function saveClientUsers(users) {
   writeJsonSafe(CLIENT_USERS_FILE, users);
 }
 
-// =========================
-// PASSWORD RESET HELPERS
-// =========================
-const RESET_CODE_TTL_MS = 15 * 60 * 1000; // 15 minutes
-const RESET_MAX_ATTEMPTS = 10;
-
-function make6DigitCode() {
-  // 000000 -> 999999, padded
-  const n = crypto.randomInt(0, 1000000);
-  return String(n).padStart(6, "0");
+function loadResetTokens() {
+  return readJsonSafe(RESET_TOKENS_FILE, []);
 }
 
-function hashResetCode(code) {
-  return crypto.createHash("sha256").update(String(code)).digest("hex");
+function saveResetTokens(tokens) {
+  writeJsonSafe(RESET_TOKENS_FILE, tokens);
+}
+
+function createResetToken() {
+  return crypto.randomBytes(32).toString("hex");
 }
 
 // =========================
@@ -320,6 +340,8 @@ app.get("/api/health", (req, res) => {
     usersFile: CLIENT_USERS_FILE,
     allowedOrigins: ALLOWED_ORIGINS,
     diskClientUsers: diskUsers,
+    jwtSecretSet: !!JWT_SECRET,
+    smtpConfigured: !!makeMailer(),
   });
 });
 
@@ -332,11 +354,15 @@ app.post("/login", (req, res) => {
   if (!ADMIN_EMAIL || !ADMIN_PASSWORD) return res.status(500).json({ ok: false, error: "Admin credentials not configured" });
 
   if (email !== ADMIN_EMAIL || password !== ADMIN_PASSWORD) {
+    audit(req, "admin_login_failed", { actor: `admin:${email}`, extra: { ok: false } });
     return res.status(401).json({ ok: false, error: "Invalid credentials" });
   }
 
   const user = { role: "admin", email, client: "" };
   const token = signToken(user);
+
+  audit(req, "admin_login", { actor: `admin:${email}`, extra: { ok: true } });
+
   res.json({ ok: true, token, user });
 });
 
@@ -352,88 +378,16 @@ app.post("/client-login", (req, res) => {
   if (!u) return res.status(401).json({ ok: false, error: "Invalid credentials" });
 
   if (!verifyPassword(password, u.passwordHash)) {
+    audit(req, "client_login_failed", { actor: `client:${email}`, client: u.client, extra: { ok: false } });
     return res.status(401).json({ ok: false, error: "Invalid credentials" });
   }
 
   const user = { role: "client", email: u.email, client: u.client };
   const token = signToken(user);
 
+  audit(req, "client_login", { actor: `client:${email}`, client: u.client, extra: { ok: true } });
+
   res.json({ ok: true, token, user });
-});
-
-// ✅ Forgot password (PUBLIC) -> send 6-digit code
-app.post("/forgot-password", async (req, res) => {
-  const email = String(req.body?.email || "").trim().toLowerCase();
-  if (!email) return res.status(400).json({ ok: false, error: "Email is required" });
-
-  // Always respond ok (don’t reveal if the email exists)
-  try {
-    const users = loadClientUsers();
-    const u = users.find((x) => x.email === email);
-
-    if (u) {
-      const code = make6DigitCode();
-      u.reset = {
-        codeHash: hashResetCode(code),
-        expiresAt: Date.now() + RESET_CODE_TTL_MS,
-        attempts: 0,
-        createdAt: new Date().toISOString(),
-      };
-      saveClientUsers(users);
-
-      // send email (if SMTP not configured, this will throw and we'll still respond ok)
-      await sendPasswordResetCodeEmail({ toEmail: email, code });
-    }
-  } catch (e) {
-    console.warn("forgot-password error:", e?.message || e);
-  }
-
-  res.json({ ok: true, message: "If that email exists, a reset code has been sent." });
-});
-
-// ✅ Reset password (PUBLIC) -> verify code + set new password
-app.post("/reset-password", (req, res) => {
-  const email = String(req.body?.email || "").trim().toLowerCase();
-  const code = String(req.body?.code || "").trim();
-  const newPassword = String(req.body?.newPassword || "").trim();
-
-  if (!email) return res.status(400).json({ ok: false, error: "Email is required" });
-  if (!code || code.length !== 6) return res.status(400).json({ ok: false, error: "6-digit code is required" });
-  if (!newPassword || newPassword.length < 8) return res.status(400).json({ ok: false, error: "Password must be at least 8 characters" });
-
-  const users = loadClientUsers();
-  const u = users.find((x) => x.email === email);
-  if (!u || !u.reset?.codeHash) {
-    return res.status(400).json({ ok: false, error: "Invalid or expired reset code" });
-  }
-
-  const r = u.reset;
-
-  if (typeof r.expiresAt !== "number" || Date.now() > r.expiresAt) {
-    u.reset = null;
-    saveClientUsers(users);
-    return res.status(400).json({ ok: false, error: "Invalid or expired reset code" });
-  }
-
-  r.attempts = Number(r.attempts || 0) + 1;
-  if (r.attempts > RESET_MAX_ATTEMPTS) {
-    u.reset = null;
-    saveClientUsers(users);
-    return res.status(429).json({ ok: false, error: "Too many attempts. Please request a new code." });
-  }
-
-  const incomingHash = hashResetCode(code);
-  if (incomingHash !== r.codeHash) {
-    saveClientUsers(users);
-    return res.status(400).json({ ok: false, error: "Invalid or expired reset code" });
-  }
-
-  // success: set new password + clear reset data
-  u.passwordHash = hashPassword(newPassword);
-  u.reset = null;
-  saveClientUsers(users);
-
-  res.json({ ok: true, message: "Password updated successfully" });
 });
 
 // Client register (PUBLIC)
@@ -496,13 +450,18 @@ app.post("/client-register", async (req, res) => {
       companyName,
       services: servicesArray,
       createdAt: new Date().toISOString(),
-      status: "active", // ✅ useful for your future active/archived
     };
 
     users.push(newUser);
     saveClientUsers(users);
 
-    // ✅ Notify admin (Outlook)
+    audit(req, "client_register", {
+      actor: `client:${email}`,
+      client: folderName,
+      extra: { businessType, services: servicesArray },
+    });
+
+    // Notify admin (Outlook)
     try {
       await sendAdminNewClientEmail(
         { email, businessType, firstName, lastName, companyName, services: servicesArray },
@@ -521,6 +480,89 @@ app.post("/client-register", async (req, res) => {
   }
 });
 
+// Password reset (PUBLIC): request link
+app.post("/password-reset/request", async (req, mockingRes) => {
+  try {
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    if (!email) return mockingRes.status(400).json({ ok: false, error: "Email is required" });
+
+    const users = loadClientUsers();
+    const u = users.find((x) => x.email === email);
+
+    // Always return OK to prevent email enumeration
+    if (!u) return mockingRes.json({ ok: true });
+
+    const token = createResetToken();
+    const expiresAt = Date.now() + 30 * 60 * 1000; // 30 minutes
+
+    const tokens = loadResetTokens().filter((t) => t.expiresAt > Date.now());
+    tokens.push({ email, token, expiresAt });
+    saveResetTokens(tokens);
+
+    const base = FRONTEND_URL ? FRONTEND_URL.replace(/\/+$/, "") : "";
+    const resetLink = base
+      ? `${base}/reset-password?token=${token}&email=${encodeURIComponent(email)}`
+      : `Reset token: ${token}`;
+
+    try {
+      await sendPasswordResetEmail(email, resetLink);
+    } catch (e) {
+      console.warn("reset email failed:", e.message);
+    }
+
+    audit(req, "password_reset_requested", {
+      actor: `client:${email}`,
+      client: u.client,
+      extra: { hasMailer: !!makeMailer() },
+    });
+
+    // In dev, return token if email not configured
+    const includeToken = process.env.NODE_ENV !== "production" && !makeMailer();
+    mockingRes.json({ ok: true, ...(includeToken ? { token } : {}) });
+  } catch (e) {
+    mockingRes.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Password reset (PUBLIC): confirm
+app.post("/password-reset/confirm", (req, res) => {
+  try {
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const token = String(req.body?.token || "").trim();
+    const newPassword = String(req.body?.newPassword || "").trim();
+
+    if (!email || !token) return res.status(400).json({ ok: false, error: "Email and token are required" });
+    if (!newPassword || newPassword.length < 8) return res.status(400).json({ ok: false, error: "Password must be at least 8 characters" });
+
+    const tokens = loadResetTokens();
+    const match = tokens.find((t) => t.email === email && t.token === token);
+
+    if (!match) return res.status(400).json({ ok: false, error: "Invalid reset token" });
+    if (match.expiresAt <= Date.now()) return res.status(400).json({ ok: false, error: "Reset token expired" });
+
+    const users = loadClientUsers();
+    const idx = users.findIndex((x) => x.email === email);
+    if (idx < 0) return res.status(400).json({ ok: false, error: "Invalid reset token" });
+
+    users[idx].passwordHash = hashPassword(newPassword);
+    users[idx].updatedAt = new Date().toISOString();
+    saveClientUsers(users);
+
+    const remaining = tokens.filter((t) => !(t.email === email && t.token === token));
+    saveResetTokens(remaining);
+
+    audit(req, "password_reset_confirmed", {
+      actor: `client:${email}`,
+      client: users[idx].client,
+      extra: { ok: true },
+    });
+
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // Current user (PROTECTED)
 app.get("/api/me", authRequired, (req, res) => {
   res.json({ ok: true, user: req.user });
@@ -534,9 +576,31 @@ app.get("/api/clients", authRequired, adminOnly, (req, res) => {
     client: u.client,
     businessType: u.businessType,
     createdAt: u.createdAt,
-    status: u.status || "active",
   }));
   res.json({ ok: true, clients: list });
+});
+
+// Admin audit log (ADMIN)
+app.get("/api/admin/audit", authRequired, adminOnly, (req, res) => {
+  try {
+    ensureDir(AUDIT_DIR);
+    if (!fs.existsSync(AUDIT_FILE)) return res.json({ ok: true, lines: [] });
+
+    const text = fs.readFileSync(AUDIT_FILE, "utf8");
+    const lines = text.split("\n").filter(Boolean);
+
+    const last = lines.slice(-500).map((l) => {
+      try {
+        return JSON.parse(l);
+      } catch {
+        return { raw: l };
+      }
+    });
+
+    res.json({ ok: true, lines: last });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 // =========================
@@ -585,8 +649,15 @@ app.post("/api/clients/:client/mkdir", authRequired, (req, res) => {
     const name = normalizeName(req.body?.name);
     if (!name) throw new Error("Missing folder name");
 
-    const { abs } = resolveClientPath(req.user, req.params.client, rel);
+    const { abs, clientName } = resolveClientPath(req.user, req.params.client, rel);
     ensureDir(path.join(abs, name));
+
+    audit(req, "mkdir", {
+      actor: `${req.user.role}:${req.user.email}`,
+      client: clientName,
+      extra: { path: rel, name },
+    });
+
     res.json({ ok: true });
   } catch (e) {
     res.status(400).json({ ok: false, error: e.message });
@@ -599,10 +670,17 @@ app.post("/api/clients/:client/writeText", authRequired, (req, res) => {
     const fileName = normalizeName(req.body?.fileName || "note.txt");
     const text = String(req.body?.text || "");
 
-    const { abs } = resolveClientPath(req.user, req.params.client, rel);
+    const { abs, clientName } = resolveClientPath(req.user, req.params.client, rel);
     ensureDir(abs);
 
     fs.writeFileSync(path.join(abs, fileName), text, "utf8");
+
+    audit(req, "write_text", {
+      actor: `${req.user.role}:${req.user.email}`,
+      client: clientName,
+      extra: { path: rel, fileName },
+    });
+
     res.json({ ok: true });
   } catch (e) {
     res.status(400).json({ ok: false, error: e.message });
@@ -617,7 +695,7 @@ app.post("/api/clients/:client/uploadBase64", authRequired, (req, res) => {
     if (!fileName) throw new Error("Missing fileName");
     if (!base64.startsWith("data:")) throw new Error("Invalid base64 data URL");
 
-    const { abs } = resolveClientPath(req.user, req.params.client, rel);
+    const { abs, clientName } = resolveClientPath(req.user, req.params.client, rel);
     ensureDir(abs);
 
     const comma = base64.indexOf(",");
@@ -625,6 +703,13 @@ app.post("/api/clients/:client/uploadBase64", authRequired, (req, res) => {
     const buf = Buffer.from(raw, "base64");
 
     fs.writeFileSync(path.join(abs, fileName), buf);
+
+    audit(req, "upload_base64", {
+      actor: `${req.user.role}:${req.user.email}`,
+      client: clientName,
+      extra: { path: rel, fileName, bytes: buf.length },
+    });
+
     res.json({ ok: true });
   } catch (e) {
     res.status(400).json({ ok: false, error: e.message });
@@ -637,10 +722,17 @@ app.get("/api/clients/:client/download", authRequired, (req, res) => {
     const file = String(req.query.file || "");
     if (!file) throw new Error("Missing file");
 
-    const { abs } = resolveClientPath(req.user, req.params.client, rel);
+    const { abs, clientName } = resolveClientPath(req.user, req.params.client, rel);
     const fp = path.join(abs, file);
 
     if (!fs.existsSync(fp)) return res.status(404).send("Not found");
+
+    audit(req, "download", {
+      actor: `${req.user.role}:${req.user.email}`,
+      client: clientName,
+      extra: { path: rel, file },
+    });
+
     res.download(fp);
   } catch (e) {
     res.status(400).send(e.message);
@@ -677,6 +769,13 @@ app.post("/api/clients/:client/trash", authRequired, (req, res) => {
     const dest = path.join(trashRoot, destName);
 
     fs.renameSync(src, dest);
+
+    audit(req, "trash", {
+      actor: `${req.user.role}:${req.user.email}`,
+      client: clientName,
+      extra: { fromPath: rel, name, trashedAs: destName },
+    });
+
     res.json({ ok: true });
   } catch (e) {
     res.status(400).json({ ok: false, error: e.message });
@@ -711,6 +810,13 @@ app.post("/api/clients/:client/restore", authRequired, (req, res) => {
     }
 
     fs.renameSync(from, target);
+
+    audit(req, "restore", {
+      actor: `${req.user.role}:${req.user.email}`,
+      client: clientName,
+      extra: { trashRel: rel, name, restoredTo: path.basename(target) },
+    });
+
     res.json({ ok: true });
   } catch (e) {
     res.status(400).json({ ok: false, error: e.message });
@@ -732,6 +838,12 @@ app.delete("/api/clients/:client/trash", authRequired, (req, res) => {
       ensureDir(target);
     }
 
+    audit(req, "empty_trash_scope", {
+      actor: `${req.user.role}:${req.user.email}`,
+      client: clientName,
+      extra: { trashRel: rel },
+    });
+
     res.json({ ok: true });
   } catch (e) {
     res.status(400).json({ ok: false, error: e.message });
@@ -751,6 +863,13 @@ app.delete("/api/clients/:client/trashItem", authRequired, (req, res) => {
     if (!fs.existsSync(target)) throw new Error("Not found");
 
     fs.rmSync(target, { recursive: true, force: true });
+
+    audit(req, "delete_trash_item", {
+      actor: `${req.user.role}:${req.user.email}`,
+      client: clientName,
+      extra: { trashRel: rel, name },
+    });
+
     res.json({ ok: true });
   } catch (e) {
     res.status(400).json({ ok: false, error: e.message });
@@ -766,9 +885,12 @@ function bootLog() {
   console.log("JWT_SECRET set:", JWT_SECRET ? "YES" : "NO");
   console.log("ADMIN_EMAIL set:", ADMIN_EMAIL ? "YES" : "NO");
   console.log("ADMIN_NOTIFY_EMAIL set:", ADMIN_NOTIFY_EMAIL ? "YES" : "NO");
+  console.log("FRONTEND_URL:", FRONTEND_URL || "(not set)");
   console.log("BASE_DIR:", BASE_DIR);
   console.log("CLIENTS_DIR:", CLIENTS_DIR);
   console.log("CLIENT_USERS_FILE:", CLIENT_USERS_FILE);
+  console.log("RESET_TOKENS_FILE:", RESET_TOKENS_FILE);
+  console.log("AUDIT_FILE:", AUDIT_FILE);
 
   const mailer = makeMailer();
   console.log("SMTP configured:", mailer ? "YES" : "NO");
@@ -777,6 +899,7 @@ function bootLog() {
 ensureDir(BASE_DIR);
 ensureDir(CLIENTS_DIR);
 ensureDir(USERS_DIR);
+ensureDir(AUDIT_DIR);
 
 app.listen(PORT, () => {
   bootLog();
