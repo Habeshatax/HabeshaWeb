@@ -1,12 +1,12 @@
-// server.js (FULL FILE - copy/paste)
+// server.js (FULL FILE)  ✅ updated: client status + forgot/reset password too
 
 import express from "express";
 import fs from "fs";
 import path from "path";
-import os from "os";
 import cors from "cors";
 import jwt from "jsonwebtoken";
-import bcrypt from "bcryptjs";
+import crypto from "crypto";
+import nodemailer from "nodemailer";
 import { fileURLToPath } from "url";
 
 const app = express();
@@ -18,849 +18,781 @@ const __dirname = path.dirname(__filename);
 // ----- Middleware -----
 app.use(express.json({ limit: "25mb" }));
 
-// ----- CORS -----
+// =========================
+// CONFIG / ENV
+// =========================
+const PORT = process.env.PORT || 10000;
+
+const JWT_SECRET = process.env.JWT_SECRET || "";
+if (!JWT_SECRET) console.warn("⚠️ JWT_SECRET is missing. Set it in Render env vars.");
+
+const ADMIN_EMAIL = String(process.env.ADMIN_EMAIL || "").trim().toLowerCase();
+const ADMIN_PASSWORD = String(process.env.ADMIN_PASSWORD || "").trim();
+
+// ✅ Admin notification recipient (defaults to ADMIN_EMAIL)
+const ADMIN_NOTIFY_EMAIL = String(process.env.ADMIN_NOTIFY_EMAIL || ADMIN_EMAIL || "")
+  .trim()
+  .toLowerCase();
+
+const BASE_DIR = process.env.BASE_DIR || "/var/data/habesha";
+const CLIENTS_DIR = process.env.CLIENTS_DIR || path.join(BASE_DIR, "clients");
+const USERS_DIR = process.env.USERS_DIR || path.join(BASE_DIR, "_users");
+const CLIENT_USERS_FILE =
+  process.env.CLIENT_USERS_FILE || path.join(USERS_DIR, "clients.json");
+
+// ✅ Password reset store
+const RESET_TOKENS_FILE =
+  process.env.RESET_TOKENS_FILE || path.join(USERS_DIR, "reset_tokens.json");
+
+// ✅ frontend url for reset link (set in Render)
+const FRONTEND_URL = String(process.env.FRONTEND_URL || "").trim(); // e.g. https://habesha-frontend-app.onrender.com
+
+// CORS allowed origins (comma separated) + allow localhost any port
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
+const allowLocalhostAnyPort = true;
+
 const corsOptions = {
   origin: (origin, cb) => {
-    if (!origin) return cb(null, true); // allow curl/Postman/server-to-server
-    if (ALLOWED_ORIGINS.length === 0) return cb(null, true); // allow all (testing)
+    if (!origin) return cb(null, true);
+
+    if (allowLocalhostAnyPort) {
+      try {
+        const u = new URL(origin);
+        if (u.hostname === "localhost" || u.hostname === "127.0.0.1") return cb(null, true);
+      } catch {}
+    }
+
+    if (ALLOWED_ORIGINS.length === 0) return cb(null, true);
     if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+
     return cb(new Error("CORS blocked for origin: " + origin));
   },
-  credentials: true,
+  credentials: false,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
-  maxAge: 86400,
 };
 
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 
-// ----- Config -----
-const PORT = process.env.PORT || 8787;
-
-// Optional legacy static token support
-const AUTH_TOKEN = (process.env.AUTH_TOKEN || "").trim();
-
-// Admin credentials
-const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || "").trim().toLowerCase();
-const ADMIN_PASSWORD = (process.env.ADMIN_PASSWORD || "").trim();
-
-// Legacy single client fallback (optional)
-const CLIENT_EMAIL = (process.env.CLIENT_EMAIL || "").trim().toLowerCase();
-const CLIENT_PASSWORD = (process.env.CLIENT_PASSWORD || "").trim();
-const CLIENT_NAME = (process.env.CLIENT_NAME || "").trim();
-
-// Optional legacy multi client list (optional)
-const CLIENT_USERS_JSON = (process.env.CLIENT_USERS_JSON || "").trim();
-
-// JWT secret
-const JWT_SECRET = (process.env.JWT_SECRET || "").trim();
-
-// Base directory
-const BASE_DIR =
-  process.env.BASE_DIR ||
-  (process.env.RENDER ? "/tmp/habesha" : path.join(os.homedir(), "Documents", "Habesha"));
-
-const CLIENTS_DIR = path.join(BASE_DIR, "clients");
-
-// --------------------------
-// Helpers
-// --------------------------
+// =========================
+// UTILITIES
+// =========================
 function ensureDir(p) {
-  if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
+  fs.mkdirSync(p, { recursive: true });
 }
 
-function safeName(input) {
-  return String(input || "")
+function readJsonSafe(file, fallback) {
+  try {
+    if (!fs.existsSync(file)) return fallback;
+    const txt = fs.readFileSync(file, "utf8");
+    return txt ? JSON.parse(txt) : fallback;
+  } catch (e) {
+    console.warn("readJsonSafe error:", e.message);
+    return fallback;
+  }
+}
+
+function writeJsonSafe(file, data) {
+  ensureDir(path.dirname(file));
+  fs.writeFileSync(file, JSON.stringify(data, null, 2), "utf8");
+}
+
+function normalizeName(s) {
+  return String(s || "")
     .trim()
-    .replace(/[^a-zA-Z0-9._ -]/g, "_")
     .replace(/\s+/g, " ")
-    .slice(0, 120);
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, "")
+    .trim();
 }
 
-function resolveInside(base, target) {
-  const baseResolved = path.resolve(base);
-  const full = path.resolve(baseResolved, target);
-  if (!full.startsWith(baseResolved + path.sep) && full !== baseResolved) {
-    throw new Error("Invalid path");
-  }
-  return full;
+function clientDisplayName({ businessType, firstName, lastName, companyName }) {
+  if (businessType === "limited_company") return normalizeName(companyName);
+  return normalizeName(`${firstName} ${lastName}`);
 }
 
-function getBearer(req) {
-  const auth = req.headers.authorization || "";
-  if (auth.toLowerCase().startsWith("bearer ")) return auth.slice(7).trim();
-  return "";
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = crypto.pbkdf2Sync(password, salt, 120000, 32, "sha256").toString("hex");
+  return `${salt}:${hash}`;
 }
 
-function verifyJwtToken(token) {
-  if (!JWT_SECRET) return null;
+function verifyPassword(password, stored) {
+  const [salt, hash] = String(stored || "").split(":");
+  if (!salt || !hash) return false;
+  const test = crypto.pbkdf2Sync(password, salt, 120000, 32, "sha256").toString("hex");
+  return crypto.timingSafeEqual(Buffer.from(test, "hex"), Buffer.from(hash, "hex"));
+}
+
+function signToken(user) {
+  return jwt.sign(
+    { role: user.role, email: user.email, client: user.client || "" },
+    JWT_SECRET,
+    { expiresIn: "30d" }
+  );
+}
+
+function authRequired(req, res, next) {
+  const h = req.headers.authorization || "";
+  const token = h.startsWith("Bearer ") ? h.slice(7) : "";
+  if (!token) return res.status(401).json({ ok: false, error: "Missing token" });
+
   try {
-    return jwt.verify(token, JWT_SECRET);
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
+    next();
   } catch {
-    return null;
+    return res.status(401).json({ ok: false, error: "Invalid token" });
   }
 }
 
-function normalizeRelPath(p) {
-  const raw = String(p || "").trim();
-  if (!raw) return "";
-
-  const cleaned = raw.replace(/\\/g, "/").replace(/^\/+/, "");
-  const decoded = decodeURIComponent(cleaned);
-
-  if (decoded.includes("..")) throw new Error("Invalid path");
-  if (decoded.includes("\0")) throw new Error("Invalid path");
-
-  return decoded.replace(/\/{2,}/g, "/");
+function adminOnly(req, res, next) {
+  if (req.user?.role !== "admin") return res.status(403).json({ ok: false, error: "Admin only" });
+  next();
 }
 
-// ✅ Recursive copy (folder fallback)
-function copyRecursiveSync(src, dest) {
-  const stat = fs.statSync(src);
-
-  if (stat.isDirectory()) {
-    ensureDir(dest);
-    for (const entry of fs.readdirSync(src)) {
-      copyRecursiveSync(path.join(src, entry), path.join(dest, entry));
-    }
-    return;
-  }
-
-  fs.copyFileSync(src, dest);
+function safeRel(p) {
+  const clean = String(p || "").replace(/\\/g, "/").replace(/^\/+/, "");
+  if (clean.includes("..")) throw new Error("Invalid path");
+  return clean;
 }
 
-// ✅ Recursive delete (folder support)
-function removeRecursiveSync(target) {
-  if (!fs.existsSync(target)) return;
-  const stat = fs.statSync(target);
-
-  if (stat.isDirectory()) {
-    for (const entry of fs.readdirSync(target)) {
-      removeRecursiveSync(path.join(target, entry));
-    }
-    fs.rmdirSync(target);
-    return;
-  }
-
-  fs.unlinkSync(target);
+function clientRoot(clientName) {
+  return path.join(CLIENTS_DIR, clientName);
 }
 
-// --------------------------
-// Persistent client user store (on disk)
-// --------------------------
-const USERS_DIR = path.join(BASE_DIR, "_users");
-const CLIENT_USERS_FILE = path.join(USERS_DIR, "clients.json");
+// =========================
+// EMAIL (Outlook / Microsoft 365)
+// =========================
+function makeMailer() {
+  const host = process.env.SMTP_HOST;
+  const port = Number(process.env.SMTP_PORT || "587");
+  const user = process.env.SMTP_USER;
+  const pass = process.env.SMTP_PASS;
+  const from = process.env.SMTP_FROM || user;
 
-function ensureUsersStore() {
-  ensureDir(USERS_DIR);
-  if (!fs.existsSync(CLIENT_USERS_FILE)) {
-    fs.writeFileSync(CLIENT_USERS_FILE, JSON.stringify([], null, 2), "utf8");
-  }
+  if (!host || !user || !pass || !from) return null;
+
+  const transporter = nodemailer.createTransport({
+    host,
+    port,
+    secure: false,
+    auth: { user, pass },
+  });
+
+  return { transporter, from };
 }
 
-function readClientUsersFromDisk() {
-  ensureUsersStore();
-  try {
-    const raw = fs.readFileSync(CLIENT_USERS_FILE, "utf8");
-    const arr = JSON.parse(raw || "[]");
-    return Array.isArray(arr) ? arr : [];
-  } catch {
-    return [];
-  }
+async function sendAdminNewClientEmail(payload, createdClientFolder) {
+  if (!ADMIN_NOTIFY_EMAIL) return;
+
+  const mailer = makeMailer();
+  if (!mailer) return;
+
+  const { transporter, from } = mailer;
+
+  const subject = `New client registered: ${payload.email}`;
+  const lines = [
+    "A new client has registered in HabeshaWeb.",
+    "",
+    `Email: ${payload.email}`,
+    `Business Type: ${payload.businessType}`,
+    `Client Folder: ${createdClientFolder}`,
+    `Name/Company: ${
+      payload.businessType === "limited_company"
+        ? payload.companyName
+        : `${payload.firstName} ${payload.lastName}`
+    }`,
+    `Services: ${(payload.services || []).join(", ") || "(none)"}`,
+    "",
+    `Time (UTC): ${new Date().toISOString()}`,
+  ];
+
+  await transporter.sendMail({
+    from,
+    to: ADMIN_NOTIFY_EMAIL,
+    subject,
+    text: lines.join("\n"),
+  });
 }
 
-function writeClientUsersToDisk(users) {
-  ensureUsersStore();
-  fs.writeFileSync(CLIENT_USERS_FILE, JSON.stringify(users, null, 2), "utf8");
+// ✅ Password reset email
+async function sendPasswordResetEmail(toEmail, resetUrl) {
+  const mailer = makeMailer();
+  if (!mailer) return;
+
+  const { transporter, from } = mailer;
+
+  await transporter.sendMail({
+    from,
+    to: toEmail,
+    subject: "Reset your password",
+    text: [
+      "You requested a password reset.",
+      "",
+      "Use this link to reset your password:",
+      resetUrl,
+      "",
+      "If you didn’t request this, you can ignore this email.",
+    ].join("\n"),
+  });
 }
 
-// --------------------------
-// Optional legacy client user list from ENV (read-only fallback)
-// --------------------------
-function parseClientUsersFromEnv() {
-  const users = [];
+// =========================
+// FOLDER STRUCTURE CREATION
+// =========================
+function createClientStructure(clientFolderName, services = []) {
+  const root = clientRoot(clientFolderName);
+  ensureDir(root);
 
-  // JSON list
-  if (CLIENT_USERS_JSON) {
-    try {
-      const parsed = JSON.parse(CLIENT_USERS_JSON);
-      if (Array.isArray(parsed)) {
-        for (const u of parsed) {
-          const email = String(u?.email || "").trim().toLowerCase();
-          const password = String(u?.password || "").trim();
-          const client = String(u?.client || "").trim();
-          if (!email || !password || !client) continue;
-          users.push({ email, password, client: safeName(client) });
-        }
-      }
-    } catch (e) {
-      console.error("❌ Failed to parse CLIENT_USERS_JSON:", e.message);
-    }
-  }
+  ensureDir(path.join(root, "00 Engagement Letter"));
+  ensureDir(path.join(root, "01 Proof of ID", "01 Passport - BRP - eVisa"));
+  ensureDir(path.join(root, "01 Proof of ID", "02 Proof of Address"));
+  ensureDir(path.join(root, "01 Proof of ID", "03 Signed Engagement Letter"));
 
-  // single legacy client
-  if (CLIENT_EMAIL && CLIENT_PASSWORD && CLIENT_NAME) {
-    users.push({
-      email: CLIENT_EMAIL,
-      password: CLIENT_PASSWORD,
-      client: safeName(CLIENT_NAME),
-    });
-  }
+  ensureDir(path.join(root, "03 Work"));
+  ensureDir(path.join(root, "05 Downloads", "_Trash"));
 
-  // de-duplicate by email
-  const map = new Map();
-  for (const u of users) map.set(u.email, u);
-  return Array.from(map.values());
+  const compliance = path.join(root, "02 Compliance");
+  ensureDir(compliance);
+
+  const addServiceFolder = (name) => ensureDir(path.join(compliance, name));
+
+  if (services.includes("self_assessment")) addServiceFolder("01 Self Assessment");
+  if (services.includes("landlords")) addServiceFolder("02 Landlords");
+  if (services.includes("limited_company")) addServiceFolder("03 Limited Company");
+  if (services.includes("payroll")) addServiceFolder("04 Payroll");
+  if (services.includes("vat_mtd")) addServiceFolder("05 VAT - MTD");
+  if (services.includes("bookkeeping")) addServiceFolder("06 Bookkeeping");
+  if (services.includes("home_office")) addServiceFolder("07 Home Office - Other");
 }
 
-const CLIENT_USERS_ENV = parseClientUsersFromEnv();
-
-// --------------------------
-// Build client folder name from registration
-// --------------------------
-function buildClientFolderName({ businessType, firstName, lastName, companyName }) {
-  const bt = String(businessType || "").trim();
-
-  if (bt === "limited_company") {
-    const cn = safeName(companyName);
-    if (!cn) throw new Error("Company name is required for limited companies");
-    return cn;
-  }
-
-  const fn = safeName(firstName);
-  const ln = safeName(lastName);
-  if (!fn || !ln) throw new Error("First name and last name are required");
-  return safeName(`${fn} ${ln}`);
+// =========================
+// USERS STORAGE
+// =========================
+function loadClientUsers() {
+  return readJsonSafe(CLIENT_USERS_FILE, []);
 }
 
-// --------------------------
-// AUTH middleware
-// --------------------------
-
-// Protect only /api routes
-function requireAuth(req, res, next) {
-  if (!AUTH_TOKEN && !JWT_SECRET) return next();
-
-  const token = getBearer(req);
-
-  // Legacy fixed AUTH_TOKEN
-  if (AUTH_TOKEN && token === AUTH_TOKEN) {
-    req.user = { id: "legacy", email: "legacy@token", role: "admin" };
-    return next();
-  }
-
-  const payload = verifyJwtToken(token);
-  if (payload) {
-    req.user = payload;
-    return next();
-  }
-
-  return res.status(401).json({ ok: false, error: "Unauthorized" });
+function saveClientUsers(users) {
+  writeJsonSafe(CLIENT_USERS_FILE, users);
 }
 
-function requireAdmin(req, res, next) {
-  if ((req.user?.role || "") === "admin") return next();
-  return res.status(403).json({ ok: false, error: "Forbidden (admin only)" });
+function loadResetTokens() {
+  return readJsonSafe(RESET_TOKENS_FILE, []);
 }
 
-// Client can only access their own :client folder
-function enforceClientMatch(req, res, next) {
-  const role = req.user?.role || "admin";
-  if (role === "admin") return next();
-
-  const routeClient = safeName(req.params.client || "");
-  const tokenClient = safeName(req.user?.client || "");
-  if (!routeClient || !tokenClient) return res.status(403).json({ ok: false, error: "Forbidden" });
-
-  if (routeClient !== tokenClient) {
-    return res.status(403).json({ ok: false, error: "Forbidden (client mismatch)" });
-  }
-  return next();
+function saveResetTokens(tokens) {
+  writeJsonSafe(RESET_TOKENS_FILE, tokens);
 }
 
-// Client writes allowed only inside these roots
-const CLIENT_WRITE_ROOTS = ["05 Downloads", "03 Work"];
-
-function isAllowedClientWrite(rel) {
-  const r = normalizeRelPath(rel || "");
-  if (!r) return false;
-  return CLIENT_WRITE_ROOTS.some((root) => r === root || r.startsWith(root + "/"));
-}
-
-function requireWriteAccess(req, res, next) {
-  const role = req.user?.role || "admin";
-  if (role === "admin") return next();
-
-  const rel = normalizeRelPath(req.query.path || "");
-  if (!isAllowedClientWrite(rel)) {
-    return res.status(403).json({
-      ok: false,
-      error: `Forbidden (client can only write inside: ${CLIENT_WRITE_ROOTS.join(", ")})`,
-    });
-  }
-  return next();
-}
-
-// Boot folders/stores
-ensureDir(CLIENTS_DIR);
-ensureUsersStore();
-
-// ----- Health -----
-app.get("/health", (req, res) => res.status(200).send("ok"));
-
+// =========================
+// ROUTES
+// =========================
 app.get("/api/health", (req, res) => {
-  const diskUsers = readClientUsersFromDisk();
-  res.status(200).json({
+  const diskUsers = loadClientUsers().map((u) => ({
+    email: u.email,
+    client: u.client,
+    status: u.status || "active",
+  }));
+  res.json({
     ok: true,
     service: "habeshaweb",
     baseDir: BASE_DIR,
     clientsDir: CLIENTS_DIR,
     usersFile: CLIENT_USERS_FILE,
-    diskClientUsers: diskUsers.map((u) => ({ email: u.email, client: u.client })),
-    envClientUsers: CLIENT_USERS_ENV.map((u) => ({ email: u.email, client: u.client })),
+    diskClientUsers: diskUsers,
   });
 });
 
-// ----- Home -----
-app.get("/", (req, res) => {
-  res.status(200).send("HabeshaWeb backend is running. Try /health or /api/health");
-});
-
-// ----- Admin Login (PUBLIC) -----
-// POST /login { email, password }
+// Admin login (PUBLIC)
 app.post("/login", (req, res) => {
-  try {
-    const email = String(req.body?.email || "").trim().toLowerCase();
-    const password = String(req.body?.password || "").trim();
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  const password = String(req.body?.password || "").trim();
 
-    if (!ADMIN_EMAIL || !ADMIN_PASSWORD) {
-      return res.status(500).json({ ok: false, error: "ADMIN_EMAIL / ADMIN_PASSWORD not set on server" });
-    }
-    if (email !== ADMIN_EMAIL || password !== ADMIN_PASSWORD) {
-      return res.status(401).json({ ok: false, error: "Invalid login" });
-    }
-    if (!JWT_SECRET) return res.status(500).json({ ok: false, error: "JWT_SECRET not set on server" });
+  if (!email || !password) return res.status(400).json({ ok: false, error: "Email and password required" });
+  if (!ADMIN_EMAIL || !ADMIN_PASSWORD) return res.status(500).json({ ok: false, error: "Admin credentials not configured" });
 
-    const user = { id: "admin", email: ADMIN_EMAIL, role: "admin" };
-    const token = jwt.sign(user, JWT_SECRET, { expiresIn: "7d" });
-    return res.json({ ok: true, token, user });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message });
+  if (email !== ADMIN_EMAIL || password !== ADMIN_PASSWORD) {
+    return res.status(401).json({ ok: false, error: "Invalid credentials" });
   }
+
+  const user = { role: "admin", email, client: "" };
+  const token = signToken(user);
+  res.json({ ok: true, token, user });
 });
 
-// ----- Client Register (PUBLIC) -----
-// POST /client-register
-// body: {
-//   businessType, firstName, lastName, companyName,
-//   email, password,
-//   services: ["bookkeeping","vat_mtd",...]
-// }
+// Client login (PUBLIC)
+app.post("/client-login", (req, res) => {
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  const password = String(req.body?.password || "").trim();
+
+  if (!email || !password) return res.status(400).json({ ok: false, error: "Email and password required" });
+
+  const users = loadClientUsers();
+  const u = users.find((x) => x.email === email);
+  if (!u) return res.status(401).json({ ok: false, error: "Invalid credentials" });
+
+  if ((u.status || "active") === "archived") {
+    return res.status(403).json({ ok: false, error: "Account archived. Contact admin." });
+  }
+
+  if (!verifyPassword(password, u.passwordHash)) {
+    return res.status(401).json({ ok: false, error: "Invalid credentials" });
+  }
+
+  const user = { role: "client", email: u.email, client: u.client };
+  const token = signToken(user);
+
+  res.json({ ok: true, token, user });
+});
+
+// Client register (PUBLIC)
 app.post("/client-register", async (req, res) => {
   try {
-    if (!JWT_SECRET) {
-      return res.status(500).json({ ok: false, error: "JWT_SECRET not set on server" });
-    }
-
     const businessType = String(req.body?.businessType || "").trim();
     const firstName = String(req.body?.firstName || "").trim();
     const lastName = String(req.body?.lastName || "").trim();
     const companyName = String(req.body?.companyName || "").trim();
-
     const email = String(req.body?.email || "").trim().toLowerCase();
     const password = String(req.body?.password || "").trim();
-
-    const services = Array.isArray(req.body?.services)
-      ? req.body.services.map((s) => String(s || "").trim()).filter(Boolean)
-      : [];
+    const services = Array.isArray(req.body?.services) ? req.body.services.map((s) => String(s)) : [];
 
     if (!email) return res.status(400).json({ ok: false, error: "Email is required" });
-    if (password.length < 8) return res.status(400).json({ ok: false, error: "Password must be at least 8 characters" });
+    if (!password || password.length < 8) return res.status(400).json({ ok: false, error: "Password must be at least 8 characters" });
 
-    // Create client folder name (company or first+last)
-    const clientFolder = buildClientFolderName({ businessType, firstName, lastName, companyName });
+    if (!["self_assessment", "landlords", "limited_company"].includes(businessType)) {
+      return res.status(400).json({ ok: false, error: "Invalid businessType" });
+    }
 
-    // Ensure client folder exists
-    const clientPath = resolveInside(CLIENTS_DIR, clientFolder);
-    ensureDir(clientPath);
+    if (businessType === "limited_company") {
+      if (!companyName) return res.status(400).json({ ok: false, error: "Company name is required" });
+    } else {
+      if (!firstName || !lastName) return res.status(400).json({ ok: false, error: "First and last name are required" });
+    }
 
-    // Read users from disk
-    const users = readClientUsersFromDisk();
+    ensureDir(CLIENTS_DIR);
+    ensureDir(USERS_DIR);
 
-    // Prevent duplicate email (disk)
-    const existsDisk = users.find((u) => String(u?.email || "").toLowerCase() === email);
-    if (existsDisk) {
+    const users = loadClientUsers();
+    if (users.some((u) => u.email === email)) {
       return res.status(409).json({ ok: false, error: "This email is already registered" });
     }
 
-    // Also prevent clash with env fallback users (optional)
-    const existsEnv = CLIENT_USERS_ENV.find((u) => u.email === email);
-    if (existsEnv) {
-      return res.status(409).json({ ok: false, error: "This email is already registered (server env user)" });
+    const clientName = clientDisplayName({ businessType, firstName, lastName, companyName });
+    if (!clientName) return res.status(400).json({ ok: false, error: "Invalid client name" });
+
+    let folderName = clientName;
+    let i = 2;
+    while (fs.existsSync(clientRoot(folderName))) {
+      folderName = `${clientName} (${i})`;
+      i += 1;
     }
 
-    // Hash password
-    const passwordHash = await bcrypt.hash(password, 10);
+    const finalServices = new Set(services);
+    finalServices.add(businessType);
+    const servicesArray = Array.from(finalServices);
 
-    // Save user to disk
+    createClientStructure(folderName, servicesArray);
+
+    const passwordHash = hashPassword(password);
     const newUser = {
+      role: "client",
       email,
       passwordHash,
-      client: clientFolder,
-      businessType: businessType || "",
-      services,
+      client: folderName,
+      businessType,
+      firstName,
+      lastName,
+      companyName,
+      services: servicesArray,
+      status: "active", // ✅ NEW
       createdAt: new Date().toISOString(),
     };
 
     users.push(newUser);
-    writeClientUsersToDisk(users);
+    saveClientUsers(users);
 
-    // Issue JWT token and log in immediately
-    const userForToken = { id: "client", email, role: "client", client: clientFolder };
-    const token = jwt.sign(userForToken, JWT_SECRET, { expiresIn: "7d" });
-
-    return res.json({
-      ok: true,
-      token,
-      user: userForToken,
-      createdClientFolder: clientFolder,
-    });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// ----- Client Login (PUBLIC) -----
-// POST /client-login { email, password }
-app.post("/client-login", async (req, res) => {
-  try {
-    const email = String(req.body?.email || "").trim().toLowerCase();
-    const password = String(req.body?.password || "").trim();
-
-    if (!JWT_SECRET) return res.status(500).json({ ok: false, error: "JWT_SECRET not set on server" });
-
-    // 1) Try disk users first (recommended)
-    const diskUsers = readClientUsersFromDisk();
-    const diskMatch = diskUsers.find((u) => String(u?.email || "").toLowerCase() === email);
-
-    if (diskMatch) {
-      const ok = await bcrypt.compare(password, String(diskMatch.passwordHash || ""));
-      if (!ok) return res.status(401).json({ ok: false, error: "Invalid login" });
-
-      const clientFolder = safeName(diskMatch.client);
-      const clientPath = resolveInside(CLIENTS_DIR, clientFolder);
-      ensureDir(clientPath);
-
-      const user = { id: "client", email: diskMatch.email, role: "client", client: clientFolder };
-      const token = jwt.sign(user, JWT_SECRET, { expiresIn: "7d" });
-
-      return res.json({ ok: true, token, user });
+    try {
+      await sendAdminNewClientEmail(
+        { email, businessType, firstName, lastName, companyName, services: servicesArray },
+        folderName
+      );
+    } catch (e) {
+      console.warn("Admin email failed:", e.message);
     }
 
-    // 2) Optional fallback: ENV users (plaintext passwords)
-    if (CLIENT_USERS_ENV.length) {
-      const envMatch = CLIENT_USERS_ENV.find((u) => u.email === email && u.password === password);
-      if (!envMatch) return res.status(401).json({ ok: false, error: "Invalid login" });
+    const user = { role: "client", email, client: folderName };
+    const token = signToken(user);
 
-      const clientFolder = safeName(envMatch.client);
-      const clientPath = resolveInside(CLIENTS_DIR, clientFolder);
-      ensureDir(clientPath);
+    res.json({ ok: true, token, user });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message || "Server error" });
+  }
+});
 
-      const user = { id: "client", email: envMatch.email, role: "client", client: clientFolder };
-      const token = jwt.sign(user, JWT_SECRET, { expiresIn: "7d" });
+// Current user (PROTECTED)
+app.get("/api/me", authRequired, (req, res) => {
+  res.json({ ok: true, user: req.user });
+});
 
-      return res.json({ ok: true, token, user });
+// List clients (ADMIN)
+app.get("/api/clients", authRequired, adminOnly, (req, res) => {
+  const users = loadClientUsers();
+  const list = users.map((u) => ({
+    email: u.email,
+    client: u.client,
+    businessType: u.businessType,
+    status: u.status || "active", // ✅ NEW
+    createdAt: u.createdAt,
+  }));
+  res.json({ ok: true, clients: list });
+});
+
+// ✅ Update client status (ADMIN)
+app.patch("/api/clients/:client/status", authRequired, adminOnly, (req, res) => {
+  try {
+    const clientName = decodeURIComponent(req.params.client || "");
+    const status = String(req.body?.status || "").trim().toLowerCase();
+
+    if (!clientName) return res.status(400).json({ ok: false, error: "Missing client" });
+    if (!["active", "archived"].includes(status)) {
+      return res.status(400).json({ ok: false, error: "Invalid status" });
     }
 
-    return res.status(401).json({ ok: false, error: "Invalid login" });
+    const users = loadClientUsers();
+    const idx = users.findIndex((u) => u.client === clientName);
+    if (idx < 0) return res.status(404).json({ ok: false, error: "Client not found" });
+
+    users[idx].status = status;
+    saveClientUsers(users);
+
+    res.json({ ok: true });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message });
+    res.status(500).json({ ok: false, error: e.message || "Server error" });
   }
 });
 
-// ----- API (protected) -----
-app.use("/api", requireAuth);
+// =========================
+// FILE BROWSER (PROTECTED)
+// =========================
+function resolveClientPath(requestingUser, clientParam, relPath = "") {
+  const clientName = decodeURIComponent(clientParam || "");
+  if (!clientName) throw new Error("Missing client");
 
-app.get("/api/me", (req, res) => res.json({ ok: true, user: req.user || null }));
-
-// Admin-only: list clients
-app.get("/api/clients", requireAdmin, (req, res) => {
-  try {
-    const items = fs
-      .readdirSync(CLIENTS_DIR, { withFileTypes: true })
-      .filter((d) => d.isDirectory())
-      .map((d) => d.name)
-      .sort((a, b) => a.localeCompare(b));
-
-    res.json({ ok: true, clients: items });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+  if (requestingUser.role === "client" && requestingUser.client !== clientName) {
+    throw new Error("Forbidden: wrong client");
   }
-});
 
-// Admin-only: create client (folder only)
-app.post("/api/clients", requireAdmin, (req, res) => {
+  const root = clientRoot(clientName);
+  const rel = safeRel(relPath || "");
+  const abs = path.join(root, rel);
+
+  const rootNorm = path.resolve(root);
+  const absNorm = path.resolve(abs);
+  if (!absNorm.startsWith(rootNorm)) throw new Error("Invalid path");
+
+  return { root, abs, rel, clientName };
+}
+
+app.get("/api/clients/:client/files", authRequired, (req, res) => {
   try {
-    const name = safeName(req.body?.name);
-    if (!name) return res.status(400).json({ ok: false, error: "Client name required" });
+    const rel = req.query.path ? String(req.query.path) : "";
+    const { abs } = resolveClientPath(req.user, req.params.client, rel);
 
-    const clientPath = resolveInside(CLIENTS_DIR, name);
-    const existed = fs.existsSync(clientPath);
-    ensureDir(clientPath);
-
-    res.json({ ok: true, client: name, created: !existed });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// Create folder (write)
-app.post("/api/clients/:client/mkdir", enforceClientMatch, requireWriteAccess, (req, res) => {
-  try {
-    const client = safeName(req.params.client);
-    const rel = normalizeRelPath(req.query.path || "");
-    const name = safeName(req.body?.name);
-    if (!name) return res.status(400).json({ ok: false, error: "name required" });
-
-    const clientPath = resolveInside(CLIENTS_DIR, client);
-    ensureDir(clientPath);
-
-    const targetDir = rel ? resolveInside(clientPath, rel) : clientPath;
-    ensureDir(targetDir);
-
-    const folderPath = resolveInside(targetDir, name);
-    ensureDir(folderPath);
-
-    res.json({ ok: true, created: true, name, path: rel });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// Write text (write)
-app.post("/api/clients/:client/writeText", enforceClientMatch, requireWriteAccess, (req, res) => {
-  try {
-    const client = safeName(req.params.client);
-    const rel = normalizeRelPath(req.query.path || "");
-    const fileName = safeName(req.body?.fileName);
-    const text = String(req.body?.text || "");
-    if (!fileName) return res.status(400).json({ ok: false, error: "fileName required" });
-
-    const clientPath = resolveInside(CLIENTS_DIR, client);
-    ensureDir(clientPath);
-
-    const targetDir = rel ? resolveInside(clientPath, rel) : clientPath;
-    ensureDir(targetDir);
-
-    const full = resolveInside(targetDir, fileName);
-    fs.writeFileSync(full, text, "utf8");
-
-    res.json({ ok: true, savedAs: fileName, bytes: Buffer.byteLength(text, "utf8"), path: rel });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// List items (read)
-app.get("/api/clients/:client/files", enforceClientMatch, (req, res) => {
-  try {
-    const client = safeName(req.params.client);
-    const rel = normalizeRelPath(req.query.path || "");
-
-    const clientPath = resolveInside(CLIENTS_DIR, client);
-    ensureDir(clientPath);
-
-    const targetDir = rel ? resolveInside(clientPath, rel) : clientPath;
-    ensureDir(targetDir);
-
-    const raw = fs.readdirSync(targetDir, { withFileTypes: true }).map((d) => ({
+    ensureDir(abs);
+    const entries = fs.readdirSync(abs, { withFileTypes: true });
+    const items = entries.map((d) => ({
       name: d.name,
       type: d.isDirectory() ? "dir" : "file",
     }));
 
-    raw.sort((a, b) => {
-      if (a.type !== b.type) return a.type === "dir" ? -1 : 1;
-      return a.name.localeCompare(b.name);
-    });
-
-    res.json({
-      ok: true,
-      client,
-      path: rel,
-      fullPath: rel ? `${client}/${rel}` : client,
-      items: raw,
-    });
+    res.json({ ok: true, items });
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    res.status(400).json({ ok: false, error: e.message });
   }
 });
 
-// Download (read)
-app.get("/api/clients/:client/download", enforceClientMatch, (req, res) => {
+app.post("/api/clients/:client/mkdir", authRequired, (req, res) => {
   try {
-    const client = safeName(req.params.client);
+    const rel = req.query.path ? String(req.query.path) : "";
+    const name = normalizeName(req.body?.name);
+    if (!name) throw new Error("Missing folder name");
+
+    const { abs } = resolveClientPath(req.user, req.params.client, rel);
+    ensureDir(path.join(abs, name));
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+app.post("/api/clients/:client/writeText", authRequired, (req, res) => {
+  try {
+    const rel = req.query.path ? String(req.query.path) : "";
+    const fileName = normalizeName(req.body?.fileName || "note.txt");
+    const text = String(req.body?.text || "");
+
+    const { abs } = resolveClientPath(req.user, req.params.client, rel);
+    ensureDir(abs);
+
+    fs.writeFileSync(path.join(abs, fileName), text, "utf8");
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+app.post("/api/clients/:client/uploadBase64", authRequired, (req, res) => {
+  try {
+    const rel = req.query.path ? String(req.query.path) : "";
+    const fileName = normalizeName(req.body?.fileName);
+    const base64 = String(req.body?.base64 || "");
+    if (!fileName) throw new Error("Missing fileName");
+    if (!base64.startsWith("data:")) throw new Error("Invalid base64 data URL");
+
+    const { abs } = resolveClientPath(req.user, req.params.client, rel);
+    ensureDir(abs);
+
+    const comma = base64.indexOf(",");
+    const raw = comma >= 0 ? base64.slice(comma + 1) : "";
+    const buf = Buffer.from(raw, "base64");
+
+    fs.writeFileSync(path.join(abs, fileName), buf);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+app.get("/api/clients/:client/download", authRequired, (req, res) => {
+  try {
+    const rel = req.query.path ? String(req.query.path) : "";
     const file = String(req.query.file || "");
-    const rel = normalizeRelPath(req.query.path || "");
-    if (!file) return res.status(400).json({ ok: false, error: "file query required" });
+    if (!file) throw new Error("Missing file");
 
-    const clientPath = resolveInside(CLIENTS_DIR, client);
-    const targetDir = rel ? resolveInside(clientPath, rel) : clientPath;
-    const full = resolveInside(targetDir, file);
+    const { abs } = resolveClientPath(req.user, req.params.client, rel);
+    const fp = path.join(abs, file);
 
-    if (!fs.existsSync(full)) return res.status(404).json({ ok: false, error: "Not found" });
-    if (fs.statSync(full).isDirectory()) return res.status(400).json({ ok: false, error: "Not a file" });
-
-    res.download(full);
+    if (!fs.existsSync(fp)) return res.status(404).send("Not found");
+    res.download(fp);
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    res.status(400).send(e.message);
   }
 });
 
-// Upload base64 (write)
-app.post("/api/clients/:client/uploadBase64", enforceClientMatch, requireWriteAccess, (req, res) => {
+// =========================
+// TRASH (PROTECTED)
+// =========================
+const TRASH_ROOT_REL = "05 Downloads/_Trash";
+
+function trashRootAbs(clientName) {
+  return path.join(clientRoot(clientName), TRASH_ROOT_REL);
+}
+
+function stamp() {
+  return new Date().toISOString().replace(/[:.]/g, "-");
+}
+
+app.post("/api/clients/:client/trash", authRequired, (req, res) => {
   try {
-    const client = safeName(req.params.client);
-    const rel = normalizeRelPath(req.query.path || "");
-    const contentType = String(req.body?.contentType || "");
+    const rel = req.query.path ? String(req.query.path) : "";
+    const name = normalizeName(req.body?.name);
+    if (!name) throw new Error("Missing name");
 
-    let fileName = safeName(req.body?.fileName);
-    const base64Input = String(req.body?.base64 || "");
+    const { abs, clientName } = resolveClientPath(req.user, req.params.client, rel);
+    const src = path.join(abs, name);
+    if (!fs.existsSync(src)) throw new Error("Not found");
 
-    if (!fileName) return res.status(400).json({ ok: false, error: "fileName required" });
-    if (!base64Input) return res.status(400).json({ ok: false, error: "base64 required" });
+    const trashRoot = trashRootAbs(clientName);
+    ensureDir(trashRoot);
 
-    if (!path.extname(fileName)) {
-      const ct = String(contentType || "").toLowerCase();
-      if (ct.includes("pdf")) fileName = `${fileName}.pdf`;
-      else if (ct.includes("png")) fileName = `${fileName}.png`;
-      else if (ct.includes("jpeg") || ct.includes("jpg")) fileName = `${fileName}.jpg`;
-      else if (ct.includes("text")) fileName = `${fileName}.txt`;
-    }
+    const destName = `${stamp()}__${name}`;
+    const dest = path.join(trashRoot, destName);
 
-    const clientPath = resolveInside(CLIENTS_DIR, client);
-    ensureDir(clientPath);
-
-    const targetDir = rel ? resolveInside(clientPath, rel) : clientPath;
-    ensureDir(targetDir);
-
-    const full = resolveInside(targetDir, fileName);
-
-    const cleaned = base64Input.includes("base64,") ? base64Input.split("base64,")[1] : base64Input;
-    const buf = Buffer.from(cleaned, "base64");
-    fs.writeFileSync(full, buf);
-
-    res.json({ ok: true, savedAs: fileName, bytes: buf.length, path: rel });
+    fs.renameSync(src, dest);
+    res.json({ ok: true });
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    res.status(400).json({ ok: false, error: e.message });
   }
 });
 
-// ✅ Trash (soft delete) (write)
-app.post("/api/clients/:client/trash", enforceClientMatch, requireWriteAccess, (req, res) => {
+app.post("/api/clients/:client/restore", authRequired, (req, res) => {
   try {
-    const client = safeName(req.params.client);
-    const rel = normalizeRelPath(req.query.path || "");
-    const name = safeName(req.body?.name);
+    const rel = req.query.path ? String(req.query.path) : "";
+    const name = normalizeName(req.body?.name);
+    if (!name) throw new Error("Missing name");
 
-    if (!name) return res.status(400).json({ ok: false, error: "name required" });
+    const { clientName } = resolveClientPath(req.user, req.params.client, "");
+    const trashRoot = trashRootAbs(clientName);
+    const from = path.join(trashRoot, safeRel(rel), name);
 
-    const clientPath = resolveInside(CLIENTS_DIR, client);
-    const fromDir = rel ? resolveInside(clientPath, rel) : clientPath;
-    const fromFull = resolveInside(fromDir, name);
+    if (!fs.existsSync(from)) throw new Error("Not found in Trash");
 
-    if (!fs.existsSync(fromFull)) return res.status(404).json({ ok: false, error: "Not found" });
+    const restoreTo = path.join(clientRoot(clientName), "05 Downloads");
+    ensureDir(restoreTo);
 
-    const trashBase = resolveInside(clientPath, path.join("05 Downloads", "_Trash"));
-    ensureDir(trashBase);
+    const parts = name.split("__");
+    const original = parts.length >= 2 ? parts.slice(1).join("__") : name;
 
-    const trashSub = rel ? resolveInside(trashBase, rel) : trashBase;
-    ensureDir(trashSub);
-
-    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-    let destName = name;
-    let destFull = resolveInside(trashSub, destName);
-
-    if (fs.existsSync(destFull)) {
-      const ext = path.extname(name);
-      const baseName = ext ? path.basename(name, ext) : name;
-      destName = `${baseName}__${stamp}${ext || ""}`;
-      destFull = resolveInside(trashSub, destName);
+    let target = path.join(restoreTo, original);
+    let i = 2;
+    while (fs.existsSync(target)) {
+      const ext = path.extname(original);
+      const base = ext ? original.slice(0, -ext.length) : original;
+      target = path.join(restoreTo, `${base} (${i})${ext}`);
+      i += 1;
     }
 
+    fs.renameSync(from, target);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+app.delete("/api/clients/:client/trash", authRequired, (req, res) => {
+  try {
+    const rel = req.query.path ? String(req.query.path) : "";
+    const { clientName } = resolveClientPath(req.user, req.params.client, "");
+
+    const trashRoot = trashRootAbs(clientName);
+    const target = path.join(trashRoot, safeRel(rel));
+
+    if (fs.existsSync(target)) {
+      fs.rmSync(target, { recursive: true, force: true });
+      ensureDir(target);
+    } else {
+      ensureDir(target);
+    }
+
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+app.delete("/api/clients/:client/trashItem", authRequired, (req, res) => {
+  try {
+    const rel = req.query.path ? String(req.query.path) : "";
+    const name = String(req.query.name || "").trim();
+    if (!name) throw new Error("Missing name");
+
+    const { clientName } = resolveClientPath(req.user, req.params.client, "");
+    const trashRoot = trashRootAbs(clientName);
+    const target = path.join(trashRoot, safeRel(rel), name);
+
+    if (!fs.existsSync(target)) throw new Error("Not found");
+
+    fs.rmSync(target, { recursive: true, force: true });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// =========================
+// FORGOT / RESET PASSWORD (PUBLIC)
+// =========================
+
+// POST /forgot-password  body: { email }
+app.post("/forgot-password", async (req, res) => {
+  try {
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    if (!email) return res.status(400).json({ ok: false, error: "Email is required" });
+
+    // Always respond ok (avoid user enumeration)
+    const users = loadClientUsers();
+    const u = users.find((x) => x.email === email);
+
+    if (!u) return res.json({ ok: true });
+
+    if (!FRONTEND_URL) {
+      console.warn("⚠️ FRONTEND_URL missing - cannot send reset link");
+      return res.json({ ok: true });
+    }
+
+    const tokens = loadResetTokens().filter((t) => Date.now() < t.expiresAt);
+    const token = crypto.randomBytes(32).toString("hex");
+    const expiresAt = Date.now() + 60 * 60 * 1000; // 1 hour
+
+    tokens.push({ token, email, expiresAt });
+    saveResetTokens(tokens);
+
+    const resetUrl = `${FRONTEND_URL.replace(/\/+$/, "")}/reset-password?token=${token}`;
     try {
-      fs.renameSync(fromFull, destFull);
-    } catch {
-      copyRecursiveSync(fromFull, destFull);
-      removeRecursiveSync(fromFull);
-    }
-
-    return res.json({
-      ok: true,
-      moved: name,
-      fromPath: rel,
-      trashedAs: destName,
-      trashPath: rel ? `05 Downloads/_Trash/${rel}` : "05 Downloads/_Trash",
-    });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// ♻️ Restore from Trash (write)
-app.post("/api/clients/:client/restore", enforceClientMatch, requireWriteAccess, (req, res) => {
-  try {
-    const client = safeName(req.params.client);
-    const rel = normalizeRelPath(req.query.path || "");
-    const name = safeName(req.query.name || req.body?.name);
-
-    if (!name) return res.status(400).json({ ok: false, error: "name required" });
-
-    const clientPath = resolveInside(CLIENTS_DIR, client);
-    ensureDir(clientPath);
-
-    const trashBase = resolveInside(clientPath, path.join("05 Downloads", "_Trash"));
-    ensureDir(trashBase);
-
-    const trashSub = rel ? resolveInside(trashBase, rel) : trashBase;
-    const trashedFull = resolveInside(trashSub, name);
-
-    if (!fs.existsSync(trashedFull)) {
-      return res.status(404).json({ ok: false, error: "Item not found in Trash" });
-    }
-
-    const toDir = rel ? resolveInside(clientPath, rel) : clientPath;
-    ensureDir(toDir);
-
-    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-    let destName = name;
-    let destFull = resolveInside(toDir, destName);
-
-    if (fs.existsSync(destFull)) {
-      const ext = path.extname(name);
-      const baseName = ext ? path.basename(name, ext) : name;
-      destName = `${baseName}__restored__${stamp}${ext || ""}`;
-      destFull = resolveInside(toDir, destName);
-    }
-
-    try {
-      fs.renameSync(trashedFull, destFull);
-    } catch {
-      copyRecursiveSync(trashedFull, destFull);
-      removeRecursiveSync(trashedFull);
-    }
-
-    return res.json({ ok: true, restored: name, restoredAs: destName, toPath: rel });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// 🧨 Empty Trash (write)
-app.delete("/api/clients/:client/trash", enforceClientMatch, requireWriteAccess, (req, res) => {
-  try {
-    const client = safeName(req.params.client);
-    const rel = normalizeRelPath(req.query.path || "");
-
-    const clientPath = resolveInside(CLIENTS_DIR, client);
-    ensureDir(clientPath);
-
-    const trashBase = resolveInside(clientPath, path.join("05 Downloads", "_Trash"));
-    ensureDir(trashBase);
-
-    const trashTarget = rel ? resolveInside(trashBase, rel) : trashBase;
-    if (!fs.existsSync(trashTarget)) {
-      return res.json({ ok: true, emptied: true, path: rel, note: "Trash folder did not exist" });
-    }
-
-    const entries = fs.readdirSync(trashTarget);
-    for (const entry of entries) {
-      removeRecursiveSync(path.join(trashTarget, entry));
-    }
-
-    return res.json({ ok: true, emptied: true, path: rel });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// ❌ Delete ONE item from Trash permanently (write)
-app.delete("/api/clients/:client/trashItem", enforceClientMatch, requireWriteAccess, (req, res) => {
-  try {
-    const client = safeName(req.params.client);
-    const rel = normalizeRelPath(req.query.path || "");
-    const name = safeName(req.query.name || "");
-
-    if (!name) return res.status(400).json({ ok: false, error: "name query required" });
-
-    const clientPath = resolveInside(CLIENTS_DIR, client);
-    ensureDir(clientPath);
-
-    const trashBase = resolveInside(clientPath, path.join("05 Downloads", "_Trash"));
-    ensureDir(trashBase);
-
-    const trashSub = rel ? resolveInside(trashBase, rel) : trashBase;
-    const itemFull = resolveInside(trashSub, name);
-
-    if (!fs.existsSync(itemFull)) return res.status(404).json({ ok: false, error: "Not found in Trash" });
-
-    removeRecursiveSync(itemFull);
-
-    return res.json({ ok: true, deleted: name, path: rel });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// Hard delete file (admin only)
-app.delete(
-  "/api/clients/:client/file",
-  enforceClientMatch,
-  (req, res, next) => {
-    if ((req.user?.role || "") === "client") {
-      return res.status(403).json({ ok: false, error: "Forbidden (use Trash / Delete in Trash)" });
-    }
-    return next();
-  },
-  (req, res) => {
-    try {
-      const client = safeName(req.params.client);
-      const file = String(req.query.file || "");
-      const rel = normalizeRelPath(req.query.path || "");
-      if (!file) return res.status(400).json({ ok: false, error: "file query required" });
-
-      const clientPath = resolveInside(CLIENTS_DIR, client);
-      const targetDir = rel ? resolveInside(clientPath, rel) : clientPath;
-      const full = resolveInside(targetDir, file);
-
-      if (!fs.existsSync(full)) return res.status(404).json({ ok: false, error: "Not found" });
-      if (fs.statSync(full).isDirectory()) return res.status(400).json({ ok: false, error: "Not a file" });
-
-      fs.unlinkSync(full);
-      res.json({ ok: true, deleted: file, path: rel });
+      await sendPasswordResetEmail(email, resetUrl);
     } catch (e) {
-      res.status(500).json({ ok: false, error: e.message });
+      console.warn("Reset email failed:", e.message);
     }
-  }
-);
 
-// ----- Start -----
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`HabeshaWeb backend running on :${PORT}`);
-  console.log(`ALLOWED_ORIGINS: ${ALLOWED_ORIGINS.length ? ALLOWED_ORIGINS.join(", ") : "(not set - allowing all)"}`);
-  console.log(`AUTH_TOKEN set: ${AUTH_TOKEN ? "YES" : "NO"}`);
-  console.log(`JWT_SECRET set: ${JWT_SECRET ? "YES" : "NO"}`);
-  console.log(`ADMIN_EMAIL set: ${ADMIN_EMAIL ? "YES" : "NO"}`);
-  console.log(`BASE_DIR: ${BASE_DIR}`);
-  console.log(`CLIENTS_DIR: ${CLIENTS_DIR}`);
-  console.log(`USERS_DIR: ${USERS_DIR}`);
-  console.log(`CLIENT_USERS_FILE: ${CLIENT_USERS_FILE}`);
-  console.log(`CLIENT_WRITE_ROOTS: ${CLIENT_WRITE_ROOTS.join(", ")}`);
-  console.log(`ENV client users configured: ${CLIENT_USERS_ENV.length}`);
-  console.log(`Disk client users currently: ${readClientUsersFromDisk().length}`);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message || "Server error" });
+  }
+});
+
+// POST /reset-password  body: { token, password }
+app.post("/reset-password", async (req, res) => {
+  try {
+    const token = String(req.body?.token || "").trim();
+    const password = String(req.body?.password || "").trim();
+
+    if (!token) return res.status(400).json({ ok: false, error: "Token is required" });
+    if (!password || password.length < 8) {
+      return res.status(400).json({ ok: false, error: "Password must be at least 8 characters" });
+    }
+
+    const tokens = loadResetTokens();
+    const found = tokens.find((t) => t.token === token);
+
+    if (!found || Date.now() > found.expiresAt) {
+      return res.status(400).json({ ok: false, error: "Invalid or expired token" });
+    }
+
+    const users = loadClientUsers();
+    const idx = users.findIndex((u) => u.email === found.email);
+    if (idx < 0) return res.status(400).json({ ok: false, error: "Invalid token" });
+
+    users[idx].passwordHash = hashPassword(password);
+    saveClientUsers(users);
+
+    // consume token
+    const remaining = tokens.filter((t) => t.token !== token);
+    saveResetTokens(remaining);
+
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message || "Server error" });
+  }
+});
+
+// =========================
+// STARTUP
+// =========================
+function bootLog() {
+  console.log("HabeshaWeb backend running on:", PORT);
+  console.log("ALLOWED_ORIGINS:", ALLOWED_ORIGINS.join(", ") || "(none - allow all)");
+  console.log("JWT_SECRET set:", JWT_SECRET ? "YES" : "NO");
+  console.log("ADMIN_EMAIL set:", ADMIN_EMAIL ? "YES" : "NO");
+  console.log("ADMIN_NOTIFY_EMAIL set:", ADMIN_NOTIFY_EMAIL ? "YES" : "NO");
+  console.log("BASE_DIR:", BASE_DIR);
+  console.log("CLIENTS_DIR:", CLIENTS_DIR);
+  console.log("CLIENT_USERS_FILE:", CLIENT_USERS_FILE);
+  console.log("FRONTEND_URL:", FRONTEND_URL || "(missing)");
+
+  const mailer = makeMailer();
+  console.log("SMTP configured:", mailer ? "YES" : "NO");
+}
+
+ensureDir(BASE_DIR);
+ensureDir(CLIENTS_DIR);
+ensureDir(USERS_DIR);
+
+app.listen(PORT, () => {
+  bootLog();
 });
