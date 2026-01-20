@@ -1,4 +1,4 @@
-// server.js (FULL FILE)  ✅ updated: client status + forgot/reset password too
+// server.js (FULL FILE)
 
 import express from "express";
 import fs from "fs";
@@ -40,13 +40,6 @@ const USERS_DIR = process.env.USERS_DIR || path.join(BASE_DIR, "_users");
 const CLIENT_USERS_FILE =
   process.env.CLIENT_USERS_FILE || path.join(USERS_DIR, "clients.json");
 
-// ✅ Password reset store
-const RESET_TOKENS_FILE =
-  process.env.RESET_TOKENS_FILE || path.join(USERS_DIR, "reset_tokens.json");
-
-// ✅ frontend url for reset link (set in Render)
-const FRONTEND_URL = String(process.env.FRONTEND_URL || "").trim(); // e.g. https://habesha-frontend-app.onrender.com
-
 // CORS allowed origins (comma separated) + allow localhost any port
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
@@ -72,7 +65,7 @@ const corsOptions = {
     return cb(new Error("CORS blocked for origin: " + origin));
   },
   credentials: false,
-  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
 };
 
@@ -168,21 +161,33 @@ function clientRoot(clientName) {
 // =========================
 // EMAIL (Outlook / Microsoft 365)
 // =========================
+// Render env vars you should set:
+// SMTP_HOST=smtp.office365.com
+// SMTP_PORT=587
+// SMTP_USER=info@habeshatax.co.uk
+// SMTP_PASS=*** (app password / smtp enabled password)
+// SMTP_FROM=info@habeshatax.co.uk  (optional)
+// SMTP_FROM_NAME=Habesha Tax & Support (optional)
+// ADMIN_NOTIFY_EMAIL=info@habeshatax.co.uk
 function makeMailer() {
   const host = process.env.SMTP_HOST;
   const port = Number(process.env.SMTP_PORT || "587");
   const user = process.env.SMTP_USER;
   const pass = process.env.SMTP_PASS;
-  const from = process.env.SMTP_FROM || user;
 
-  if (!host || !user || !pass || !from) return null;
+  const fromEmail = (process.env.SMTP_FROM || user || "").trim();
+  const fromName = (process.env.SMTP_FROM_NAME || "").trim();
+
+  if (!host || !user || !pass || !fromEmail) return null;
 
   const transporter = nodemailer.createTransport({
     host,
     port,
-    secure: false,
+    secure: false, // STARTTLS on 587
     auth: { user, pass },
   });
+
+  const from = fromName ? `"${fromName}" <${fromEmail}>` : fromEmail;
 
   return { transporter, from };
 }
@@ -220,25 +225,29 @@ async function sendAdminNewClientEmail(payload, createdClientFolder) {
   });
 }
 
-// ✅ Password reset email
-async function sendPasswordResetEmail(toEmail, resetUrl) {
+async function sendPasswordResetCodeEmail({ toEmail, code }) {
   const mailer = makeMailer();
   if (!mailer) return;
 
   const { transporter, from } = mailer;
 
+  const subject = "Your password reset code (Habesha Tax & Support)";
+  const lines = [
+    "You requested a password reset for HabeshaWeb.",
+    "",
+    `Your reset code is: ${code}`,
+    "",
+    "This code expires in 15 minutes.",
+    "If you didn’t request this, you can ignore this email.",
+    "",
+    `Time (UTC): ${new Date().toISOString()}`,
+  ];
+
   await transporter.sendMail({
     from,
     to: toEmail,
-    subject: "Reset your password",
-    text: [
-      "You requested a password reset.",
-      "",
-      "Use this link to reset your password:",
-      resetUrl,
-      "",
-      "If you didn’t request this, you can ignore this email.",
-    ].join("\n"),
+    subject,
+    text: lines.join("\n"),
   });
 }
 
@@ -282,29 +291,34 @@ function saveClientUsers(users) {
   writeJsonSafe(CLIENT_USERS_FILE, users);
 }
 
-function loadResetTokens() {
-  return readJsonSafe(RESET_TOKENS_FILE, []);
+// =========================
+// PASSWORD RESET HELPERS
+// =========================
+const RESET_CODE_TTL_MS = 15 * 60 * 1000; // 15 minutes
+const RESET_MAX_ATTEMPTS = 10;
+
+function make6DigitCode() {
+  // 000000 -> 999999, padded
+  const n = crypto.randomInt(0, 1000000);
+  return String(n).padStart(6, "0");
 }
 
-function saveResetTokens(tokens) {
-  writeJsonSafe(RESET_TOKENS_FILE, tokens);
+function hashResetCode(code) {
+  return crypto.createHash("sha256").update(String(code)).digest("hex");
 }
 
 // =========================
 // ROUTES
 // =========================
 app.get("/api/health", (req, res) => {
-  const diskUsers = loadClientUsers().map((u) => ({
-    email: u.email,
-    client: u.client,
-    status: u.status || "active",
-  }));
+  const diskUsers = loadClientUsers().map((u) => ({ email: u.email, client: u.client }));
   res.json({
     ok: true,
     service: "habeshaweb",
     baseDir: BASE_DIR,
     clientsDir: CLIENTS_DIR,
     usersFile: CLIENT_USERS_FILE,
+    allowedOrigins: ALLOWED_ORIGINS,
     diskClientUsers: diskUsers,
   });
 });
@@ -337,10 +351,6 @@ app.post("/client-login", (req, res) => {
   const u = users.find((x) => x.email === email);
   if (!u) return res.status(401).json({ ok: false, error: "Invalid credentials" });
 
-  if ((u.status || "active") === "archived") {
-    return res.status(403).json({ ok: false, error: "Account archived. Contact admin." });
-  }
-
   if (!verifyPassword(password, u.passwordHash)) {
     return res.status(401).json({ ok: false, error: "Invalid credentials" });
   }
@@ -349,6 +359,81 @@ app.post("/client-login", (req, res) => {
   const token = signToken(user);
 
   res.json({ ok: true, token, user });
+});
+
+// ✅ Forgot password (PUBLIC) -> send 6-digit code
+app.post("/forgot-password", async (req, res) => {
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  if (!email) return res.status(400).json({ ok: false, error: "Email is required" });
+
+  // Always respond ok (don’t reveal if the email exists)
+  try {
+    const users = loadClientUsers();
+    const u = users.find((x) => x.email === email);
+
+    if (u) {
+      const code = make6DigitCode();
+      u.reset = {
+        codeHash: hashResetCode(code),
+        expiresAt: Date.now() + RESET_CODE_TTL_MS,
+        attempts: 0,
+        createdAt: new Date().toISOString(),
+      };
+      saveClientUsers(users);
+
+      // send email (if SMTP not configured, this will throw and we'll still respond ok)
+      await sendPasswordResetCodeEmail({ toEmail: email, code });
+    }
+  } catch (e) {
+    console.warn("forgot-password error:", e?.message || e);
+  }
+
+  res.json({ ok: true, message: "If that email exists, a reset code has been sent." });
+});
+
+// ✅ Reset password (PUBLIC) -> verify code + set new password
+app.post("/reset-password", (req, res) => {
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  const code = String(req.body?.code || "").trim();
+  const newPassword = String(req.body?.newPassword || "").trim();
+
+  if (!email) return res.status(400).json({ ok: false, error: "Email is required" });
+  if (!code || code.length !== 6) return res.status(400).json({ ok: false, error: "6-digit code is required" });
+  if (!newPassword || newPassword.length < 8) return res.status(400).json({ ok: false, error: "Password must be at least 8 characters" });
+
+  const users = loadClientUsers();
+  const u = users.find((x) => x.email === email);
+  if (!u || !u.reset?.codeHash) {
+    return res.status(400).json({ ok: false, error: "Invalid or expired reset code" });
+  }
+
+  const r = u.reset;
+
+  if (typeof r.expiresAt !== "number" || Date.now() > r.expiresAt) {
+    u.reset = null;
+    saveClientUsers(users);
+    return res.status(400).json({ ok: false, error: "Invalid or expired reset code" });
+  }
+
+  r.attempts = Number(r.attempts || 0) + 1;
+  if (r.attempts > RESET_MAX_ATTEMPTS) {
+    u.reset = null;
+    saveClientUsers(users);
+    return res.status(429).json({ ok: false, error: "Too many attempts. Please request a new code." });
+  }
+
+  const incomingHash = hashResetCode(code);
+  if (incomingHash !== r.codeHash) {
+    saveClientUsers(users);
+    return res.status(400).json({ ok: false, error: "Invalid or expired reset code" });
+  }
+
+  // success: set new password + clear reset data
+  u.passwordHash = hashPassword(newPassword);
+  u.reset = null;
+  saveClientUsers(users);
+
+  res.json({ ok: true, message: "Password updated successfully" });
 });
 
 // Client register (PUBLIC)
@@ -410,13 +495,14 @@ app.post("/client-register", async (req, res) => {
       lastName,
       companyName,
       services: servicesArray,
-      status: "active", // ✅ NEW
       createdAt: new Date().toISOString(),
+      status: "active", // ✅ useful for your future active/archived
     };
 
     users.push(newUser);
     saveClientUsers(users);
 
+    // ✅ Notify admin (Outlook)
     try {
       await sendAdminNewClientEmail(
         { email, businessType, firstName, lastName, companyName, services: servicesArray },
@@ -447,34 +533,10 @@ app.get("/api/clients", authRequired, adminOnly, (req, res) => {
     email: u.email,
     client: u.client,
     businessType: u.businessType,
-    status: u.status || "active", // ✅ NEW
     createdAt: u.createdAt,
+    status: u.status || "active",
   }));
   res.json({ ok: true, clients: list });
-});
-
-// ✅ Update client status (ADMIN)
-app.patch("/api/clients/:client/status", authRequired, adminOnly, (req, res) => {
-  try {
-    const clientName = decodeURIComponent(req.params.client || "");
-    const status = String(req.body?.status || "").trim().toLowerCase();
-
-    if (!clientName) return res.status(400).json({ ok: false, error: "Missing client" });
-    if (!["active", "archived"].includes(status)) {
-      return res.status(400).json({ ok: false, error: "Invalid status" });
-    }
-
-    const users = loadClientUsers();
-    const idx = users.findIndex((u) => u.client === clientName);
-    if (idx < 0) return res.status(404).json({ ok: false, error: "Client not found" });
-
-    users[idx].status = status;
-    saveClientUsers(users);
-
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message || "Server error" });
-  }
 });
 
 // =========================
@@ -696,82 +758,6 @@ app.delete("/api/clients/:client/trashItem", authRequired, (req, res) => {
 });
 
 // =========================
-// FORGOT / RESET PASSWORD (PUBLIC)
-// =========================
-
-// POST /forgot-password  body: { email }
-app.post("/forgot-password", async (req, res) => {
-  try {
-    const email = String(req.body?.email || "").trim().toLowerCase();
-    if (!email) return res.status(400).json({ ok: false, error: "Email is required" });
-
-    // Always respond ok (avoid user enumeration)
-    const users = loadClientUsers();
-    const u = users.find((x) => x.email === email);
-
-    if (!u) return res.json({ ok: true });
-
-    if (!FRONTEND_URL) {
-      console.warn("⚠️ FRONTEND_URL missing - cannot send reset link");
-      return res.json({ ok: true });
-    }
-
-    const tokens = loadResetTokens().filter((t) => Date.now() < t.expiresAt);
-    const token = crypto.randomBytes(32).toString("hex");
-    const expiresAt = Date.now() + 60 * 60 * 1000; // 1 hour
-
-    tokens.push({ token, email, expiresAt });
-    saveResetTokens(tokens);
-
-    const resetUrl = `${FRONTEND_URL.replace(/\/+$/, "")}/reset-password?token=${token}`;
-    try {
-      await sendPasswordResetEmail(email, resetUrl);
-    } catch (e) {
-      console.warn("Reset email failed:", e.message);
-    }
-
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message || "Server error" });
-  }
-});
-
-// POST /reset-password  body: { token, password }
-app.post("/reset-password", async (req, res) => {
-  try {
-    const token = String(req.body?.token || "").trim();
-    const password = String(req.body?.password || "").trim();
-
-    if (!token) return res.status(400).json({ ok: false, error: "Token is required" });
-    if (!password || password.length < 8) {
-      return res.status(400).json({ ok: false, error: "Password must be at least 8 characters" });
-    }
-
-    const tokens = loadResetTokens();
-    const found = tokens.find((t) => t.token === token);
-
-    if (!found || Date.now() > found.expiresAt) {
-      return res.status(400).json({ ok: false, error: "Invalid or expired token" });
-    }
-
-    const users = loadClientUsers();
-    const idx = users.findIndex((u) => u.email === found.email);
-    if (idx < 0) return res.status(400).json({ ok: false, error: "Invalid token" });
-
-    users[idx].passwordHash = hashPassword(password);
-    saveClientUsers(users);
-
-    // consume token
-    const remaining = tokens.filter((t) => t.token !== token);
-    saveResetTokens(remaining);
-
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message || "Server error" });
-  }
-});
-
-// =========================
 // STARTUP
 // =========================
 function bootLog() {
@@ -783,7 +769,6 @@ function bootLog() {
   console.log("BASE_DIR:", BASE_DIR);
   console.log("CLIENTS_DIR:", CLIENTS_DIR);
   console.log("CLIENT_USERS_FILE:", CLIENT_USERS_FILE);
-  console.log("FRONTEND_URL:", FRONTEND_URL || "(missing)");
 
   const mailer = makeMailer();
   console.log("SMTP configured:", mailer ? "YES" : "NO");
